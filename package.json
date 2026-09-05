@@ -1,0 +1,57 @@
+{
+  "name": "personal-ledger",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24 <27" },
+  "allowScripts": {
+    "better-sqlite3": true,
+    "esbuild": true,
+    "fsevents": false,
+    "unrs-resolver": false
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build --webpack",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit --incremental false",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:mcp": "tsx tests/mcp/roundtrip.ts",
+    "test:mcp:http": "tsx tests/mcp/http-roundtrip.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:seed": "tsx scripts/seed.ts",
+    "db:backup": "node scripts/backup.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "@supabase/ssr": "0.12.5",
+    "@supabase/supabase-js": "2.114.0",
+    "better-sqlite3": "13.0.3",
+    "drizzle-orm": "0.45.2",
+    "lucide-react": "1.41.0",
+    "luxon": "^3.7.2",
+    "next": "16.3.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "server-only": "0.0.1",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.13",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/luxon": "^3.7.1",
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "eslint": "^9.35.0",
+    "eslint-config-next": "16.3.4",
+    "tailwindcss": "^4.1.13",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.0"
+  }
+}

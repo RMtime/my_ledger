@@ -1,0 +1,6 @@
+import { sqlite } from "@/db/client";
+import { requireUser } from "@/modules/identity/supabase";
+import { errorResponse } from "@/modules/shared/errors";
+
+const safe = (value: unknown) => { let text = typeof value === "bigint" ? value.toString() : String(value ?? ""); if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`; return `"${text.replaceAll('"','""')}"`; };
+export async function GET(request: Request) { try { const actor = await requireUser(request); const columns = ["id","kind","amount_minor","currency","occurred_at","occurred_timezone","time_precision","category_id","payment_method","account_id","channel_id","merchant","note","source","version","deleted_at"]; const rows = sqlite.prepare(`SELECT ${columns.join(",")} FROM transactions WHERE owner_id=? ORDER BY occurred_at`).all(actor.ownerId) as Array<Record<string, unknown>>; const csv = [`\ufeff${columns.join(",")}`, ...rows.map((row) => columns.map((c) => safe(row[c])).join(","))].join("\r\n"); return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="ledger-${new Date().toISOString().slice(0,10)}.csv"`, "cache-control": "no-store" } }); } catch (error) { return errorResponse(error); } }

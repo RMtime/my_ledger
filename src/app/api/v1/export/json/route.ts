@@ -1,0 +1,5 @@
+import { sqlite } from "@/db/client";
+import { requireUser } from "@/modules/identity/supabase";
+import { errorResponse } from "@/modules/shared/errors";
+
+export async function GET(request: Request) { try { const actor = await requireUser(request); const rows = sqlite.prepare(`SELECT t.*,f.base_currency,f.rate,f.base_amount_minor,f.rate_date,f.rate_source,f.rate_kind FROM transactions t LEFT JOIN transaction_fx f ON f.transaction_id=t.id WHERE t.owner_id=? ORDER BY t.created_at`).all(actor.ownerId) as Array<Record<string, unknown>>; const transactions = rows.map((row) => Object.fromEntries(Object.entries(row).map(([k,v]) => [k, typeof v === "bigint" ? v.toString() : v]))); return new Response(JSON.stringify({ schema_version: 1, exported_at: new Date().toISOString(), transactions }, null, 2), { headers: { "content-type": "application/json", "content-disposition": `attachment; filename="ledger-${new Date().toISOString().slice(0,10)}.json"`, "cache-control": "no-store" } }); } catch (error) { return errorResponse(error); } }
