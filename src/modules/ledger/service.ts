@@ -357,10 +357,34 @@ export function getTransaction(actor: ActorContext, id: string) {
   return serialize(row);
 }
 
-function listSecureTransactions(actor: ActorContext, filters: z.infer<typeof transactionFiltersSchema>) {
-  const baseRows = sqlite.prepare("SELECT id FROM transactions WHERE owner_id=? AND deleted_at IS NULL").all(actor.ownerId) as Array<{ id: string }>;
-  let items = baseRows.map(({ id }) => getOwned(actor.ownerId, id, actor)).filter((row): row is Row => Boolean(row));
+// blind_month 是按每笔自己的 occurred_timezone 生成的，与 UTC 月份可能差一个月，
+// 因此候选集在区间覆盖的 UTC 月份两侧各多取一个月。预筛只做粗筛，精确的
+// occurred_at 比较仍然照旧执行，所以即使候选偏宽也不会影响结果。
+function candidateRows(actor: ActorContext, start?: string, end?: string) {
+  const { key } = requireVaultKey(actor);
+  if (start && end) {
+    const from = DateTime.fromISO(start, { zone: "UTC" }).minus({ months: 1 });
+    const until = DateTime.fromISO(end, { zone: "UTC" }).plus({ months: 1 });
+    if (from.isValid && until.isValid) {
+      const months: string[] = [];
+      for (let cursor = from.startOf("month"); cursor <= until; cursor = cursor.plus({ months: 1 })) {
+        months.push(blindIndex(key, actor.ownerId, "transaction:month", cursor.toFormat("yyyy-MM")));
+      }
+      const placeholders = months.map(() => "?").join(",");
+      // blind_month 为空的历史密文一律保留，宁可多解密也不能漏行。
+      return sqlite.prepare(`SELECT t.id FROM transactions t
+        JOIN encrypted_entities e ON e.owner_id=t.owner_id AND e.entity_type='transaction' AND e.entity_id=t.id
+        WHERE t.owner_id=? AND t.deleted_at IS NULL AND (e.blind_month IS NULL OR e.blind_month IN (${placeholders}))`)
+        .all(actor.ownerId, ...months) as Array<{ id: string }>;
+    }
+  }
+  return sqlite.prepare("SELECT id FROM transactions WHERE owner_id=? AND deleted_at IS NULL").all(actor.ownerId) as Array<{ id: string }>;
+}
+
+function secureRows(actor: ActorContext, filters: z.infer<typeof transactionFiltersSchema>) {
   const start = filters.start ?? filters.date_from; const end = filters.end ?? filters.date_to;
+  const baseRows = candidateRows(actor, start, end);
+  let items = baseRows.map(({ id }) => getOwned(actor.ownerId, id, actor)).filter((row): row is Row => Boolean(row));
   items = items.filter((row) => (!start || String(row.occurred_at) >= start) && (!end || String(row.occurred_at) < end));
   if (filters.kind) items = items.filter((row) => row.kind === filters.kind);
   if (filters.currency) items = items.filter((row) => row.currency === filters.currency);
@@ -372,6 +396,11 @@ function listSecureTransactions(actor: ActorContext, filters: z.infer<typeof tra
   if (filters.search) { const search = filters.search.toLocaleLowerCase(); items = items.filter((row) => [row.merchant, row.note, row.category_name, row.account_name, row.channel_name, row.payment_method_name].some((value) => String(value ?? "").toLocaleLowerCase().includes(search))); }
   if (filters.refundable) items = items.filter((row) => row.kind === "expense" && BigInt(String(row.refundable_minor ?? 0)) > 0n);
   items.sort((a, b) => String(b.occurred_at).localeCompare(String(a.occurred_at)) || String(b.id).localeCompare(String(a.id)));
+  return items;
+}
+
+function listSecureTransactions(actor: ActorContext, filters: z.infer<typeof transactionFiltersSchema>) {
+  let items = secureRows(actor, filters);
   if (filters.cursor) {
     try {
       const decoded = JSON.parse(Buffer.from(filters.cursor, "base64url").toString("utf8")) as unknown;
@@ -449,12 +478,32 @@ function deleteSecureTransaction(actor: ActorContext, id: string, version: numbe
   } catch (error) { sqlite.exec("ROLLBACK"); throw error; }
 }
 
+// 聚合类调用方（统计、汇率补齐、导出）需要一次拿到区间内的全部账目。
+// 走分页会让密文路径反复全量解密，复杂度退化成二次方。
+// 这里不做 transactions:read 校验：调用方各自持有更合适的权限（例如统计只需 analytics:read），
+// 且返回值只用于服务端聚合，不直接回给凭证持有者。
+export function collectTransactions(actor: ActorContext, raw: unknown) {
+  const parsed = transactionFiltersSchema.safeParse(raw);
+  if (!parsed.success) throw new AppError("VALIDATION_ERROR", "筛选参数不正确", 422, parsed.error.flatten());
+  if (secureMode(actor)) return secureRows(actor, parsed.data).map(serialize);
+  const items: Array<ReturnType<typeof serialize>> = []; let cursor: string | null = null;
+  do {
+    const page = listPlainTransactions(actor, { ...parsed.data, limit: 100, cursor: cursor ?? undefined });
+    items.push(...page.items); cursor = page.next_cursor;
+  } while (cursor);
+  return items;
+}
+
 export function listTransactions(actor: ActorContext, raw: unknown) {
   requirePermission(actor, "transactions:read");
   const parsed = transactionFiltersSchema.safeParse(raw);
   if (!parsed.success) throw new AppError("VALIDATION_ERROR", "筛选参数不正确", 422, parsed.error.flatten());
   const filters = parsed.data;
   if (secureMode(actor)) return listSecureTransactions(actor, filters);
+  return listPlainTransactions(actor, filters);
+}
+
+function listPlainTransactions(actor: ActorContext, filters: z.infer<typeof transactionFiltersSchema>) {
   const clauses = ["t.owner_id=?", "t.deleted_at IS NULL"];
   const values: unknown[] = [actor.ownerId];
   const start = filters.start ?? filters.date_from;

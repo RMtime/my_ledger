@@ -81,6 +81,36 @@ describe("encrypted user vault", () => {
     expect(readFxSnapshot(actor, transaction.id, "HKD")?.status).toBe("available");
   });
 
+  it("keeps month-boundary and foreign-timezone rows inside a ranged query", () => {
+    // 本地 10 月 1 日 00:30 在 UTC 仍属 9 月；纽约时区那笔的月份标签也与账本时区不同。
+    // 按月预筛必须把这两类都算进候选集，否则区间查询会静默丢行。
+    const make = (occurred: string, zone = "Asia/Hong_Kong") => String((createTransaction(actor, { kind: "expense", amount_minor: "100", currency: "HKD", occurred_at: occurred, occurred_timezone: zone, time_precision: "minute", idempotency_key: randomUUID(), source: "manual" }).transaction as Record<string, string>).id);
+    const septemberEve = make("2028-09-30T23:30:00+08:00");
+    const octoberOpen = make("2028-10-01T00:30:00+08:00");
+    const octoberNewYork = make("2028-10-15T09:00:00-04:00", "America/New_York");
+    const octoberClose = make("2028-10-31T23:30:00+08:00");
+    const novemberOpen = make("2028-11-01T00:30:00+08:00");
+    const range = { start: "2028-09-30T16:00:00.000Z", end: "2028-10-31T16:00:00.000Z" };
+    const listed = listTransactions(actor, { ...range, limit: 100 });
+    expect(listed.next_cursor).toBeNull();
+    expect((listed.items as Array<Record<string, string>>).map((row) => row.id).sort()).toEqual([octoberOpen, octoberNewYork, octoberClose].sort());
+    expect(listed.items).not.toContainEqual(expect.objectContaining({ id: septemberEve }));
+    expect(listed.items).not.toContainEqual(expect.objectContaining({ id: novemberOpen }));
+    expect(getSummary(actor, range).currencies.find((currency) => currency.currency === "HKD")?.expense_minor).toBe("300");
+    // 分页与单次全量必须给出同一集合
+    const firstPage = listTransactions(actor, { ...range, limit: 2 });
+    const secondPage = listTransactions(actor, { ...range, limit: 2, cursor: firstPage.next_cursor ?? undefined });
+    expect([...firstPage.items, ...secondPage.items].map((row) => (row as Record<string, string>).id).sort()).toEqual([octoberOpen, octoberNewYork, octoberClose].sort());
+  });
+
+  it("serves a secure summary to an analytics-only credential", () => {
+    // MCP 的 get_summary 只挂在 analytics:read 下；统计内部不得再要求 transactions:read。
+    const analyticsOnly = { ...actor, actorType: "agent" as const, actorId: randomUUID(), permissions: ["analytics:read" as const] };
+    const summary = getSummary(analyticsOnly, { start: "2026-09-01T00:00:00.000Z", end: "2026-10-01T00:00:00.000Z" });
+    expect(summary.base?.currency).toBe("HKD");
+    expect(() => listTransactions(analyticsOnly, { limit: 5 })).toThrow("权限");
+  });
+
   it("keeps a second user's ciphertext, names, and transaction IDs isolated", async () => {
     const secondOwner = "00000000-0000-4000-8000-0000000000c2"; const now = new Date().toISOString(); sqlite.prepare("INSERT INTO profiles (id,auth_subject,email,timezone,base_currency,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(secondOwner, "vault-test-2", "partner@example.com", "Asia/Hong_Kong", "HKD", 1, now, now);
     const base = userActor(secondOwner, "vault-test-2"); const initialized = await initializeVault(base, "partner private passphrase"); const session = resolveVaultSession(initialized.token, secondOwner); if (!session) throw new Error("missing second vault session"); const second = { ...base, vaultKey: session.key, vaultKeyVersion: session.keyVersion };

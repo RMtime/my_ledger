@@ -3,7 +3,7 @@ import { AppError } from "@/modules/shared/errors";
 import type { ActorContext } from "@/modules/identity/types";
 import { z } from "zod";
 import { isoInstantSchema } from "@/modules/ledger/schemas";
-import { listTransactions } from "@/modules/ledger/service";
+import { collectTransactions } from "@/modules/ledger/service";
 import { readEncryptedEntity, vaultInitialized } from "@/modules/vault/entities";
 import { ensureFxSnapshots, readFxSnapshot, type FxTransaction } from "@/modules/fx/service";
 import { fetchHkmaRates } from "@/modules/fx/hkma";
@@ -25,11 +25,7 @@ export async function ensureSummaryFx(actor: ActorContext, input: { start: strin
   if (input.currency_mode !== "base" || !actor.vaultKey) return;
   const profile = getProfile(actor);
   const target = String(input.display_currency ?? profile?.base_currency ?? "HKD").toUpperCase();
-  const rows: FxTransaction[] = []; let cursor: string | null = null;
-  do {
-    const page = listTransactions(actor, { start: input.start, end: input.end, limit: 100, cursor: cursor ?? undefined });
-    rows.push(...page.items as FxTransaction[]); cursor = page.next_cursor;
-  } while (cursor);
+  const rows = collectTransactions(actor, { start: input.start, end: input.end }) as FxTransaction[];
   await ensureFxSnapshots(actor, rows, target, fetcher);
 }
 
@@ -78,8 +74,7 @@ export function getSummary(actor: ActorContext, input: { start: string; end: str
 }
 
 function getSecureSummary(actor: ActorContext, filters: z.infer<typeof summaryInputSchema>) {
-  const rows: Array<Record<string, unknown>> = []; let cursor: string | null = null;
-  do { const page = listTransactions(actor, { start: filters.start, end: filters.end, limit: 100, cursor: cursor ?? undefined }); rows.push(...page.items as Array<Record<string, unknown>>); cursor = page.next_cursor; } while (cursor);
+  const rows = collectTransactions(actor, { start: filters.start, end: filters.end }) as Array<Record<string, unknown>>;
   const profile = readEncryptedEntity<Record<string, unknown>>(actor, "profile", actor.ownerId) ?? {};
   const baseCurrency = String(filters.display_currency ?? profile.base_currency ?? "HKD").toUpperCase();
   const currencies = new Map<string, { expense: bigint; refund: bigint; income: bigint; count: number }>();
