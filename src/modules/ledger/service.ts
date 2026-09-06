@@ -19,7 +19,10 @@ const maximumMinorAmount = 999_999_999_999_999n;
 const fields = `t.id,t.kind,t.amount_minor,t.currency,t.occurred_at,t.occurred_timezone,t.time_precision,
   t.category_id,c.name category_name,t.payment_method,t.account_id,a.name account_name,t.channel_id,ch.name channel_name,
   t.merchant,t.note,t.related_transaction_id,t.transfer_group_id,t.transfer_direction,t.source,t.agent_id,
-  t.idempotency_key,t.version,t.created_at,t.updated_at,t.deleted_at`;
+  t.idempotency_key,t.version,t.created_at,t.updated_at,t.deleted_at,
+  CASE WHEN t.kind='expense' THEN t.amount_minor-COALESCE((SELECT SUM(r.amount_minor) FROM transactions r
+    WHERE r.owner_id=t.owner_id AND r.related_transaction_id=t.id AND r.kind='refund' AND r.deleted_at IS NULL),0)
+    ELSE 0 END refundable_minor`;
 
 function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
@@ -213,8 +216,23 @@ export function listTransactions(actor: ActorContext, raw: unknown) {
   const filters = parsed.data;
   const clauses = ["t.owner_id=?", "t.deleted_at IS NULL"];
   const values: unknown[] = [actor.ownerId];
-  for (const [column, value] of [["occurred_at >=", filters.start], ["occurred_at <", filters.end], ["kind =", filters.kind], ["currency =", filters.currency], ["category_id =", filters.category_id], ["account_id =", filters.account_id], ["channel_id =", filters.channel_id]] as const) {
+  const start = filters.start ?? filters.date_from;
+  const end = filters.end ?? filters.date_to;
+  for (const [column, value] of [["occurred_at >=", start], ["occurred_at <", end], ["kind =", filters.kind], ["currency =", filters.currency], ["category_id =", filters.category_id], ["payment_method =", filters.payment_method], ["account_id =", filters.account_id], ["channel_id =", filters.channel_id]] as const) {
     if (value) { clauses.push(`t.${column} ?`); values.push(value); }
+  }
+  if (filters.search) {
+    const escaped = filters.search.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
+    clauses.push(`(COALESCE(t.merchant,'') LIKE ? ESCAPE '\\' OR COALESCE(t.note,'') LIKE ? ESCAPE '\\'
+      OR COALESCE(c.name,'') LIKE ? ESCAPE '\\' OR COALESCE(a.name,'') LIKE ? ESCAPE '\\'
+      OR COALESCE(ch.name,'') LIKE ? ESCAPE '\\')`);
+    const pattern = `%${escaped}%`;
+    values.push(pattern, pattern, pattern, pattern, pattern);
+  }
+  if (filters.refundable) {
+    clauses.push("t.kind='expense'");
+    clauses.push(`t.amount_minor>COALESCE((SELECT SUM(r.amount_minor) FROM transactions r
+      WHERE r.owner_id=t.owner_id AND r.related_transaction_id=t.id AND r.kind='refund' AND r.deleted_at IS NULL),0)`);
   }
   if (filters.cursor) {
     try {

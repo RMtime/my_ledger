@@ -62,7 +62,16 @@ export const updateTransactionSchema = transactionSchema.pick({
 }).partial().extend({ version: z.number().int().positive() }).strict();
 export const transactionFiltersSchema = z.object({
   start: isoInstantSchema.optional(), end: isoInstantSchema.optional(), kind: z.enum(["expense", "income", "refund", "transfer"]).optional(),
+  date_from: isoInstantSchema.optional(), date_to: isoInstantSchema.optional(),
   currency: z.string().length(3).transform((value) => value.toUpperCase()).optional(), category_id: uuid.optional(), account_id: uuid.optional(), channel_id: uuid.optional(),
+  payment_method: z.enum(paymentMethods).optional(), search: z.string().trim().max(120).optional(),
+  refundable: z.union([z.boolean(), z.enum(["true", "false"])]).transform((value) => value === true || value === "true").optional(),
   cursor: z.string().optional(), limit: z.coerce.number().int().min(1).max(100).default(30),
-}).refine((value) => !value.start || !value.end || value.start < value.end, { message: "筛选区间不正确" });
+}).superRefine((value, ctx) => {
+  const start = value.start ?? value.date_from;
+  const end = value.end ?? value.date_to;
+  if (value.start && value.date_from) ctx.addIssue({ code: "custom", path: ["date_from"], message: "不能同时使用 start 和 date_from" });
+  if (value.end && value.date_to) ctx.addIssue({ code: "custom", path: ["date_to"], message: "不能同时使用 end 和 date_to" });
+  if (start && end && start >= end) ctx.addIssue({ code: "custom", message: "筛选区间不正确" });
+});
 export type CreateTransactionInput = z.infer<typeof createTransactionSchema>;
