@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24 <27" },
+  "engines": {
+    "node": ">=24 <27"
+  },
   "allowScripts": {
     "better-sqlite3": true,
     "esbuild": true,
@@ -22,6 +24,8 @@
     "test:mcp:http": "tsx tests/mcp/http-roundtrip.ts",
     "db:migrate": "node --import tsx scripts/migrate.ts",
     "db:audit": "node --import tsx scripts/audit-data.ts",
+    "db:audit:secure": "node --import tsx scripts/secure-audit.ts",
+    "db:cutover:secure": "node --import tsx scripts/secure-cutover.ts",
     "db:seed": "tsx scripts/seed.ts",
     "db:backup": "node scripts/backup.mjs",
     "check": "npm run lint && npm run typecheck && npm run test && npm run build"
@@ -42,6 +46,7 @@
     "zod": "4.3.6"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/postcss": "^4.1.13",
     "@types/better-sqlite3": "^7.6.13",
     "@types/luxon": "^3.7.1",

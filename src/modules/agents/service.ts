@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { sqlite } from "@/db/client";
 import { AppError } from "@/modules/shared/errors";
 import { permissions, type ActorContext, type Permission } from "@/modules/identity/types";
+import { revokeAgentVaultGrant, revokeOwnerAgentVaultGrants } from "@/modules/vault/agent-session";
 
 const digest = (value: string) => createHash("sha256").update(value).digest();
 const strictInstant = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
@@ -33,6 +34,7 @@ export function listCredentials(actor: ActorContext) {
 export function revokeCredential(actor: ActorContext, id: string) {
   const result = sqlite.prepare("UPDATE agent_credentials SET revoked_at=?,updated_at=? WHERE owner_id=? AND id=? AND revoked_at IS NULL").run(new Date().toISOString(), new Date().toISOString(), actor.ownerId, id);
   if (!result.changes) throw new AppError("NOT_FOUND", "凭证不存在", 404);
+  revokeAgentVaultGrant(id);
 }
 
 export function authenticatePat(authorization: string | null, requestId: string): ActorContext {
@@ -43,7 +45,7 @@ export function authenticatePat(authorization: string | null, requestId: string)
     FROM agent_credentials c JOIN profiles p ON p.id=c.owner_id WHERE c.token_prefix=?`).all(token.slice(0, 12)) as Array<{ id: string; owner_id: string; token_hash: string; permissions: string; expires_at: string | null; revoked_at: string | null; enabled: number }>;
   const credential = rows.find((row) => { const saved = Buffer.from(row.token_hash, "hex"); return saved.length === candidate.length && timingSafeEqual(saved, candidate); });
   if (!credential || credential.revoked_at) throw new AppError("AUTH_REQUIRED", "PAT 无效、已过期或已撤销", 401);
-  if (!credential.enabled) throw new AppError("USER_DISABLED", "PAT 所属账户已停用", 403);
+  if (!credential.enabled) { revokeOwnerAgentVaultGrants(credential.owner_id); throw new AppError("USER_DISABLED", "PAT 所属账户已停用", 403); }
   if (credential.expires_at) {
     const expiry = Date.parse(credential.expires_at);
     if (!strictInstant.test(credential.expires_at) || !Number.isFinite(expiry) || expiry <= Date.now()) throw new AppError("AUTH_REQUIRED", "PAT 无效、已过期或已撤销", 401);

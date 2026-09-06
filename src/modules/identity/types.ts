@@ -6,6 +6,8 @@ export type ActorContext = {
   actorId: string;
   permissions: Permission[];
   requestId: string;
+  vaultKey?: Buffer;
+  vaultKeyVersion?: number;
 };
 
 export function userActor(ownerId: string, requestId = crypto.randomUUID()): ActorContext {

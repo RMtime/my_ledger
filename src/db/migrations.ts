@@ -17,6 +17,9 @@ type AppliedMigration = {
 
 const migrations: readonly Migration[] = [
   { version: 1, name: "initial", filename: "drizzle/0000_initial.sql" },
+  { version: 2, name: "vault_and_metadata", filename: "drizzle/0001_vault_and_metadata.sql" },
+  { version: 3, name: "analytics_fx", filename: "drizzle/0002_analytics_fx.sql" },
+  { version: 4, name: "ai", filename: "drizzle/0003_ai.sql" },
 ];
 
 const requiredV1Tables = [
@@ -30,6 +33,9 @@ const requiredV1Tables = [
   "audit_events",
   "ai_reports",
 ] as const;
+const requiredV2Tables = ["user_vaults", "encrypted_entities", "payment_methods"] as const;
+const requiredV3Tables = ["fx_rates", "fx_snapshots"] as const;
+const requiredV4Tables = ["ai_preferences", "ai_invocations"] as const;
 
 export const latestSchemaVersion = migrations.at(-1)?.version ?? 0;
 
@@ -65,7 +71,10 @@ function assertIntegrity(database: Database.Database) {
 
 function assertRequiredTables(database: Database.Database, version: number) {
   if (version < 1) return;
-  const missing = requiredV1Tables.filter((table) => !tableExists(database, table));
+  const missing: string[] = requiredV1Tables.filter((table) => !tableExists(database, table));
+  if (version >= 2) missing.push(...requiredV2Tables.filter((table) => !tableExists(database, table)));
+  if (version >= 3) missing.push(...requiredV3Tables.filter((table) => !tableExists(database, table)));
+  if (version >= 4) missing.push(...requiredV4Tables.filter((table) => !tableExists(database, table)));
   if (missing.length) throw new Error(`Schema v${version} is missing required tables: ${missing.join(", ")}`);
 }
 

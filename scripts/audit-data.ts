@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { assertMigrationsCurrent } from "../src/db/migrations";
 import { convertHalfUp } from "../src/modules/ledger/money";
 import { normalizeUtcInstant } from "../src/modules/shared/time";
+import { auditCiphertextDatabase } from "../src/modules/vault/audit";
 
 type IdRow = { id: string };
 type FxRow = IdRow & { amount_minor: bigint; rate: string; base_amount_minor: bigint };
@@ -18,6 +19,12 @@ function ids(sql: string) {
 
 try {
   assertMigrationsCurrent(database);
+  const vaultCount = Number((database.prepare("SELECT COUNT(*) count FROM user_vaults").get() as { count: number }).count);
+  if (vaultCount > 0) {
+    const secure = auditCiphertextDatabase(database);
+    console.log(JSON.stringify({ database: target, checked_at: new Date().toISOString(), mode: "ciphertext", ...secure }, null, 2));
+    if (!secure.ok) process.exitCode = 2;
+  } else {
   const invalidRefundReferences = ids(`SELECT r.id
     FROM transactions r
     LEFT JOIN transactions original ON original.owner_id=r.owner_id AND original.id=r.related_transaction_id
@@ -59,6 +66,7 @@ try {
   const ok = findings.every((finding) => finding.count === 0);
   console.log(JSON.stringify({ database: target, checked_at: new Date().toISOString(), ok, findings }, null, 2));
   if (!ok) process.exitCode = 2;
+  }
 } finally {
   database.close();
 }

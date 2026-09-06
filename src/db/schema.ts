@@ -1,4 +1,4 @@
-import { customType, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { customType, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 const sqliteBigint = customType<{ data: bigint; driverData: bigint | number }>({
   dataType: () => "integer",
@@ -35,7 +35,7 @@ export const transactions = sqliteTable("transactions", {
   id: text("id").primaryKey(), ownerId: text("owner_id").notNull(), kind: text("kind").notNull(),
   amountMinor: sqliteBigint("amount_minor").notNull(), currency: text("currency").notNull(),
   occurredAt: text("occurred_at").notNull(), occurredTimezone: text("occurred_timezone").notNull(), timePrecision: text("time_precision").notNull(),
-  categoryId: text("category_id"), paymentMethod: text("payment_method"), accountId: text("account_id"), channelId: text("channel_id"),
+  categoryId: text("category_id"), paymentMethod: text("payment_method"), paymentMethodId: text("payment_method_id"), accountId: text("account_id"), channelId: text("channel_id"),
   merchant: text("merchant"), note: text("note"), relatedTransactionId: text("related_transaction_id"),
   transferGroupId: text("transfer_group_id"), transferDirection: text("transfer_direction"), source: text("source").notNull(), agentId: text("agent_id"),
   idempotencyKey: text("idempotency_key").notNull(), requestHash: text("request_hash").notNull(), version: integer("version").notNull().default(1),
@@ -65,3 +65,33 @@ export const aiReports = sqliteTable("ai_reports", {
   snapshotJson: text("snapshot_json").notNull(), snapshotHash: text("snapshot_hash").notNull(), model: text("model").notNull(),
   promptVersion: text("prompt_version").notNull(), reportJson: text("report_json").notNull(), createdAt: text("created_at").notNull(),
 });
+
+export const userVaults = sqliteTable("user_vaults", {
+  ownerId: text("owner_id").primaryKey(), keyVersion: integer("key_version").notNull(), kdfSalt: text("kdf_salt").notNull(),
+  kdfN: integer("kdf_n").notNull(), kdfR: integer("kdf_r").notNull(), kdfP: integer("kdf_p").notNull(),
+  passphraseEnvelope: text("passphrase_envelope").notNull(), recoveryEnvelope: text("recovery_envelope").notNull(), ...timestamps,
+});
+
+export const encryptedEntities = sqliteTable("encrypted_entities", {
+  ownerId: text("owner_id").notNull(), entityType: text("entity_type").notNull(), entityId: text("entity_id").notNull(),
+  keyVersion: integer("key_version").notNull(), nonce: text("nonce").notNull(), ciphertext: text("ciphertext").notNull(), tag: text("tag").notNull(),
+  blindMonth: text("blind_month"), blindKind: text("blind_kind"), blindCurrency: text("blind_currency"), blindName: text("blind_name"), blindIdempotency: text("blind_idempotency"), ...timestamps,
+}, (table) => [primaryKey({ columns: [table.ownerId, table.entityType, table.entityId] })]);
+
+export const paymentMethodsTable = sqliteTable("payment_methods", {
+  id: text("id").primaryKey(), ownerId: text("owner_id").notNull(), name: text("name").notNull(), legacyCode: text("legacy_code"),
+  sortOrder: integer("sort_order").notNull().default(0), archivedAt: text("archived_at"), ...timestamps,
+}, (table) => [uniqueIndex("payment_methods_owner_name_uq").on(table.ownerId, table.name), uniqueIndex("payment_methods_owner_legacy_uq").on(table.ownerId, table.legacyCode)]);
+
+export const fxRates = sqliteTable("fx_rates", {
+  source: text("source").notNull(), sourceDate: text("source_date").notNull(), currency: text("currency").notNull(), rateToHkd: text("rate_to_hkd").notNull(), fetchedAt: text("fetched_at").notNull(), rawHash: text("raw_hash").notNull(),
+}, (table) => [primaryKey({ columns: [table.source, table.sourceDate, table.currency] })]);
+export const fxSnapshots = sqliteTable("fx_snapshots", {
+  transactionId: text("transaction_id").notNull(), targetCurrency: text("target_currency").notNull(), sourceDate: text("source_date"), source: text("source").notNull(), rate: text("rate"), baseAmountMinor: sqliteBigint("base_amount_minor"), status: text("status").notNull(), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
+}, (table) => [primaryKey({ columns: [table.transactionId, table.targetCurrency] })]);
+export const aiPreferences = sqliteTable("ai_preferences", {
+  ownerId: text("owner_id").primaryKey(), provider: text("provider"), enabled: integer("enabled", { mode: "boolean" }).notNull().default(false), consentVersion: text("consent_version"), ...timestamps,
+});
+export const aiInvocations = sqliteTable("ai_invocations", {
+  id: text("id").primaryKey(), ownerId: text("owner_id").notNull(), provider: text("provider").notNull(), operation: text("operation").notNull(), status: text("status").notNull(), idempotencyKey: text("idempotency_key").notNull(), leaseExpiresAt: text("lease_expires_at").notNull(), attempts: integer("attempts").notNull().default(0), errorClass: text("error_class"), inputHash: text("input_hash").notNull(), inputTokens: integer("input_tokens"), outputTokens: integer("output_tokens"), completedAt: text("completed_at"), ...timestamps,
+}, (table) => [uniqueIndex("ai_invocations_owner_idempotency_uq").on(table.ownerId, table.idempotencyKey)]);
