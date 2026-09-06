@@ -10,7 +10,7 @@
 - Supabase Auth 邀请制多用户白名单；开发环境可显式启用本地身份
 - SHA-256 PAT、权限化 MCP tools、撤销/过期检查和审计
 - AI 候选确认与基于确定性快照的报告；无 key 时核心功能正常
-- JSON/CSV 导出、带 checksum 的显式 SQLite 迁移、迁移前在线备份、Docker Compose + Caddy HTTPS
+- JSON/CSV 导出、带 checksum 的显式 SQLite 迁移、迁移前在线备份、Docker Compose 单实例部署
 
 ## 本地运行
 
@@ -41,10 +41,10 @@ npm run build
 
 ## Ubuntu 24 部署
 
-服务器需要 Docker Engine、Compose plugin、可解析到服务器公网 IP 的域名，以及开放 TCP 80/443 和 UDP 443。部署不依赖开发电脑持续在线。
+服务器需要 Docker Engine、Compose plugin、可解析到服务器公网 IP 的域名，开放 TCP 80/443，以及一个负责终止 TLS 的 nginx。部署不依赖开发电脑持续在线。
 
 1. 将仓库复制或 clone 到服务器，创建 `.env.production`，确保 `LOCAL_DEV_AUTH=false`。
-2. 在 shell 环境或同目录 `.env` 设置 `APP_DOMAIN=ledger.example.com`；在 `.env.production` 设置 `APP_ORIGIN=https://ledger.example.com`。
+2. 在 `.env.production` 设置 `APP_ORIGIN=https://ledger.example.com`，并按部署文档配置 nginx 站点反代到 `127.0.0.1:3000`。
 3. 配置 Supabase URL、publishable key 和逗号分隔的 `ALLOWED_AUTH_EMAILS`；在 Supabase 控制台关闭公开注册并逐一邀请用户。邀请模板的确认链接应指向 `/auth/confirm?token_hash={{ .TokenHash }}&type=invite`。
 4. 构建后先运行一次性迁移任务，再启动应用：
 
@@ -56,7 +56,7 @@ docker compose ps
 curl --fail https://ledger.example.com/api/healthz
 ```
 
-SQLite 位于命名卷 `ledger-data`，不在镜像和容器临时层中。应用必须保持一个副本；不要把数据库文件放到 NFS/SMB，也不要同时启动第二个写入实例。Caddy 自动申请和续期 HTTPS 证书；若服务器已有反向代理，只启动 `app` 并把 HTTPS 流量转发至容器 3000 端口。
+SQLite 位于命名卷 `ledger-data`，不在镜像和容器临时层中。应用必须保持一个副本；不要把数据库文件放到 NFS/SMB，也不要同时启动第二个写入实例。应用容器只发布到 `127.0.0.1:3000`，由宿主机上的 nginx 终止 TLS 并反代；站点配置见部署文档。
 
 生产应用只验证 schema，不会在模块加载时静默升级。迁移历史记录版本、名称与 SQL checksum；已有数据库首次采用新迁移器时会先在 `ledger-backups` 创建完整性已验证的备份，再登记当前 v1 基线。
 

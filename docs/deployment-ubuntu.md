@@ -3,7 +3,8 @@
 ## 前置条件
 
 - 域名 A/AAAA 记录指向服务器。
-- 防火墙允许 TCP 22、80、443 与 UDP 443；SSH 端口以服务器实际设置为准。
+- 防火墙允许 TCP 22、80、443；SSH 端口以服务器实际设置为准。
+- 宿主机上的 nginx 负责终止 TLS 与证书续期（例如 certbot）。应用容器只监听 `127.0.0.1:3000`，不直接对公网暴露。
 - 安装受支持的 Docker Engine 和 Compose plugin。
 - 服务器磁盘具备足够空间，Docker data-root 位于持久磁盘。
 
@@ -21,11 +22,57 @@ NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_replace_me
 ALLOWED_AUTH_EMAILS=you@example.com,partner@example.com
 ```
 
-AI 三个变量可留空。另建只供 Compose 插值的 `.env`：
+AI 相关变量可留空。`APP_ORIGIN` 必须与用户浏览器实际访问的地址完全一致——写请求会用它做同源校验，MCP 会用它校验 Host。
 
-```dotenv
-APP_DOMAIN=ledger.example.com
+## nginx 站点配置
+
+应用容器只发布到 `127.0.0.1:3000`，由 nginx 反代：
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name ledger.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/ledger.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ledger.example.com/privkey.pem;
+
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+
+        # Host 必须透传真实域名。应用用它校验 MCP 请求来源，
+        # 若这里变成 127.0.0.1:3000，网页仍可用但 MCP 会返回 403。
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+    }
+
+    # MCP 走 Streamable HTTP，需要关闭缓冲并放宽读超时，
+    # 否则长响应会被 nginx 攒着不发。
+    location /mcp {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header Connection        "";
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+    }
+}
+
+server {
+    listen 80;
+    server_name ledger.example.com;
+    return 301 https://$host$request_uri;
+}
 ```
+
+HSTS、`X-Content-Type-Options` 与 `Referrer-Policy` 由应用自身发出（见 `next.config.ts`），nginx 不需要重复设置。
 
 ## 上线核对
 
@@ -41,6 +88,8 @@ curl --fail https://ledger.example.com/api/healthz
 ```
 
 随后用手机蜂窝网络完成一次登录、创建、刷新、编辑和撤销；用桌面端确认同一流水可见。签发一个短期 MCP PAT，用官方 SDK 示例执行 `initialize`、`tools/list` 和一次允许的调用，再撤销并确认立即返回 401。
+
+MCP 那一步同时验证 nginx 的 Host 透传：如果返回 403「Host 不在允许列表」，说明 `proxy_set_header Host $host` 缺失或写错。
 
 ## 更新
 

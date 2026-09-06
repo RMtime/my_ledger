@@ -28,8 +28,10 @@ services:
     volumes:
       - ledger-data:/app/data
       - ledger-backups:/app/backups
-    expose:
-      - "3000"
+    # 只发布到回环口：由宿主机上的 nginx 终止 TLS 并反代到这里。
+    # 不要绑 0.0.0.0，否则应用会绕过 nginx 直接暴露在公网。
+    ports:
+      - "127.0.0.1:3000:3000"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/healthz').then(r=>{if(!r.ok)process.exit(1)})"]
       interval: 30s
@@ -39,27 +41,6 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  caddy:
-    image: caddy:2.10-alpine
-    restart: unless-stopped
-    depends_on:
-      app:
-        condition: service_healthy
-    environment:
-      APP_DOMAIN: ${APP_DOMAIN}
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    security_opt:
-      - no-new-privileges:true
-
 volumes:
   ledger-data:
   ledger-backups:
-  caddy-data:
-  caddy-config:
