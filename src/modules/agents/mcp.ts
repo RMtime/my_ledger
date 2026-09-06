@@ -7,6 +7,7 @@ import { listMetadata } from "@/modules/ledger/metadata";
 import { createTransaction, getTransaction, listTransactions } from "@/modules/ledger/service";
 import { getSummary } from "@/modules/analytics/service";
 import { AppError, errorResponse } from "@/modules/shared/errors";
+import { rateLimit } from "@/modules/shared/security";
 
 const structured = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], structuredContent: value as Record<string, unknown> });
 const call = async (operation: () => unknown) => { try { return structured(operation()); } catch (error) { if (error instanceof AppError) return { ...structured({ error: { code:error.code,message:error.message,details:error.details } }), isError:true }; throw error; } };
@@ -42,10 +43,33 @@ function validateNetworkHeaders(request: Request) {
   if (origin && origin !== configured.origin) throw new AppError("FORBIDDEN", "Origin 不在允许列表", 403);
 }
 
+async function assertMcpBodyWithinLimit(request: Request) {
+  if (request.method !== "POST") return;
+  const limit = 256 * 1024;
+  const declaredLength = Number(request.headers.get("content-length") ?? 0);
+  if (!Number.isFinite(declaredLength) || declaredLength < 0 || declaredLength > limit) throw new AppError("VALIDATION_ERROR", "MCP 请求体不能超过 256 KiB", 413);
+  if (declaredLength || !request.body) return;
+  const reader = request.clone().body?.getReader();
+  if (!reader) return;
+  let received = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      received += chunk.value.byteLength;
+      if (received > limit) throw new AppError("VALIDATION_ERROR", "MCP 请求体不能超过 256 KiB", 413);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+}
+
 export async function handleMcp(request: Request) {
   try {
     validateNetworkHeaders(request);
+    await assertMcpBodyWithinLimit(request);
     const actor = authenticatePat(request.headers.get("authorization"), request.headers.get("x-request-id") ?? randomUUID());
+    rateLimit(`mcp:${actor.actorId}`, 120, 60_000);
     const handler = createMcpHandler(() => buildMcpServer(actor), { responseMode: "json" });
     return await handler.fetch(request);
   } catch (error) { return errorResponse(error); }

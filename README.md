@@ -1,13 +1,13 @@
 # 寸金 · 私人账本
 
-面向单用户的移动优先记账应用。Next.js Web、HTTP API 与 MCP 共用同一套账本服务，账目保存在服务器持久化 SQLite 文件中；默认简体中文、`Asia/Hong_Kong`、HKD，并支持 HKD/CNY/USD 原币统计。
+面向少量受邀用户的移动优先私人记账应用。Next.js Web、HTTP API 与 MCP 共用同一套账本服务，所有业务查询按用户隔离；账目保存在服务器持久化 SQLite 文件中，默认简体中文、`Asia/Hong_Kong`、HKD，并支持 HKD/CNY/USD 原币统计。
 
 ## 已实现
 
 - 快速录入、页面内断网待提交、复制新账、流水编辑与软删除
 - 精确整数金额、原币分组、手工汇率快照和换算覆盖率
 - 退款日期口径、退款上限事务保护、版本乐观锁、幂等创建
-- Supabase Auth 单用户白名单；开发环境可显式启用本地身份
+- Supabase Auth 邀请制多用户白名单；开发环境可显式启用本地身份
 - SHA-256 PAT、权限化 MCP tools、撤销/过期检查和审计
 - AI 候选确认与基于确定性快照的报告；无 key 时核心功能正常
 - JSON/CSV 导出、带 checksum 的显式 SQLite 迁移、迁移前在线备份、Docker Compose + Caddy HTTPS
@@ -45,7 +45,7 @@ npm run build
 
 1. 将仓库复制或 clone 到服务器，创建 `.env.production`，确保 `LOCAL_DEV_AUTH=false`。
 2. 在 shell 环境或同目录 `.env` 设置 `APP_DOMAIN=ledger.example.com`；在 `.env.production` 设置 `APP_ORIGIN=https://ledger.example.com`。
-3. 配置 Supabase URL、publishable key 和唯一允许邮箱；在 Supabase 控制台关闭公开注册。
+3. 配置 Supabase URL、publishable key 和逗号分隔的 `ALLOWED_AUTH_EMAILS`；在 Supabase 控制台关闭公开注册并逐一邀请用户。邀请模板的确认链接应指向 `/auth/confirm?token_hash={{ .TokenHash }}&type=invite`。
 4. 构建后先运行一次性迁移任务，再启动应用：
 
 ```bash

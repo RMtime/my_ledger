@@ -18,7 +18,7 @@ MIGRATION_BACKUP_DIR=/app/backups
 LOCAL_DEV_AUTH=false
 NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_replace_me
-ALLOWED_AUTH_EMAIL=you@example.com
+ALLOWED_AUTH_EMAILS=you@example.com,partner@example.com
 ```
 
 AI 三个变量可留空。另建只供 Compose 插值的 `.env`：

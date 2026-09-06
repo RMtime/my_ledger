@@ -1,18 +1,22 @@
-import { createServerClient } from "@supabase/ssr";
-import { cookies } from "next/headers";
 import { errorResponse, AppError } from "@/modules/shared/errors";
 import { assertSameOrigin, rateLimit } from "@/modules/shared/security";
+import { assertAllowedEmail, normalizeEmail } from "@/modules/identity/access";
+import { createSupabaseServerClient } from "@/modules/identity/supabase";
+import { z } from "zod";
+
+const loginSchema = z.object({ email: z.email().transform(normalizeEmail), password: z.string().min(1).max(1024) });
 
 export async function POST(request: Request) {
   try {
     assertSameOrigin(request); rateLimit(`login:${request.headers.get("x-forwarded-for") ?? "unknown"}`, 8, 60_000);
-    const url = process.env.NEXT_PUBLIC_SUPABASE_URL; const key = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
-    if (!url || !key) throw new AppError("UNAUTHENTICATED", "登录服务尚未配置", 503);
-    const { email, password } = await request.json(); const store = await cookies();
-    const supabase = createServerClient(url, key, { cookies: { getAll: () => store.getAll(), setAll: (items) => items.forEach((item) => store.set(item.name, item.value, item.options)) } });
+    const parsed = loginSchema.safeParse(await request.json());
+    if (!parsed.success) throw new AppError("VALIDATION_ERROR", "邮箱或密码格式不正确", 422);
+    assertAllowedEmail(parsed.data.email);
+    const supabase = await createSupabaseServerClient();
+    const { email, password } = parsed.data;
     const result = await supabase.auth.signInWithPassword({ email, password });
-    if (result.error) throw new AppError("UNAUTHENTICATED", "邮箱或密码不正确", 401);
-    if (email.toLowerCase() !== process.env.ALLOWED_AUTH_EMAIL?.toLowerCase()) { await supabase.auth.signOut(); throw new AppError("FORBIDDEN", "此账户不在允许名单中", 403); }
+    if (result.error || !result.data.user?.email) throw new AppError("AUTH_REQUIRED", "邮箱或密码不正确", 401);
+    try { assertAllowedEmail(result.data.user.email); } catch (error) { await supabase.auth.signOut(); throw error; }
     return Response.json({ ok: true });
   } catch (error) { return errorResponse(error); }
 }
