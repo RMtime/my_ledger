@@ -3,6 +3,7 @@ services:
     build:
       context: .
       target: migrator
+    user: node
     restart: "no"
     env_file: .env.production
     environment:

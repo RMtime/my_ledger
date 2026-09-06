@@ -34,4 +34,22 @@ describe("AI quota reservation", () => {
     expect(invocation).toEqual({ status: "succeeded", input_tokens: 12n, output_tokens: 8n });
     vi.unstubAllGlobals();
   });
+
+  it.each([
+    ["empty", { finish_reason: "stop", message: { content: "" } }],
+    ["truncated", { finish_reason: "length", message: { content: '{"kind":"expense"' } }],
+  ])("disables DeepSeek thinking and retries a %s structured response", async (label, firstChoice) => {
+    const requests: Array<Record<string, unknown>> = []; let calls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1; requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (calls === 1) return new Response(JSON.stringify({ choices: [firstChoice], usage: { prompt_tokens: 10, completion_tokens: 2048 } }), { status: 200, headers: { "content-type": "application/json" } });
+      return response();
+    }));
+    await expect(extractCandidate(actor, `synthetic retry ${label}`, "2026-09-06T12:00:00+08:00", "Asia/Hong_Kong")).resolves.toMatchObject({ candidate, cached: false });
+    expect(calls).toBe(2);
+    expect(requests[0]).toMatchObject({ thinking: { type: "disabled" }, max_tokens: 2048, response_format: { type: "json_object" } });
+    expect(requests[1]).toMatchObject({ thinking: { type: "disabled" }, max_tokens: 4096, response_format: { type: "json_object" } });
+    expect(sqlite.prepare("SELECT attempts,input_tokens,output_tokens FROM ai_invocations WHERE owner_id=? ORDER BY rowid DESC LIMIT 1").get(owner)).toEqual({ attempts: 1n, input_tokens: 22n, output_tokens: 2056n });
+    vi.unstubAllGlobals();
+  });
 });

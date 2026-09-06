@@ -5,7 +5,7 @@
 - 域名 A/AAAA 记录指向服务器。
 - 防火墙允许 TCP 22、80、443；SSH 端口以服务器实际设置为准。
 - 宿主机上的 nginx 负责终止 TLS 与证书续期（例如 certbot）。应用容器只监听 `127.0.0.1:3000`，不直接对公网暴露。
-- 安装受支持的 Docker Engine 和 Compose plugin。
+- 安装受支持的 Docker Engine、Compose plugin 和 Python 3（部署脚本只用它解析 Compose JSON，不接触账本内容）。
 - 服务器磁盘具备足够空间，Docker data-root 位于持久磁盘。
 
 ## 配置
@@ -93,15 +93,19 @@ MCP 那一步同时验证 nginx 的 Host 透传：如果返回 403「Host 不在
 
 ## 更新
 
-更新前先在线备份并复制到服务器外。然后拉取明确版本，停止唯一写入实例，显式运行迁移，再启动新版本：
+首次取得部署脚本时，在服务器仓库中先手工快进一次，然后执行脚本：
 
 ```bash
-docker compose stop app
-docker compose build --pull
-docker compose run --rm migrate
-docker compose run --rm migrate npm run db:audit
-docker compose up -d
-curl --fail https://ledger.example.com/api/healthz
+git pull --ff-only origin main
+./scripts/deploy-update.sh
 ```
 
-迁移器在 schema 发生变化前还会向 `/app/backups` 写入一份通过 `integrity_check` 的自动备份；这不能代替更新前复制到服务器外的备份。任何 checksum 不一致、未知版本、缺表、外键错误或完整性错误都会终止迁移。不要运行两个 app 副本做滚动更新；SQLite 模式采用短暂停机替换单实例。
+以后每次更新只需在服务器仓库运行：
+
+```bash
+./scripts/deploy-update.sh
+```
+
+脚本会锁定并发部署、拒绝脏工作树或分叉历史、从 `origin/main` 仅做 fast-forward、使用 SQLite backup API 创建并验证备份、比对容器与宿主机副本的 SHA-256，并在停机前确认新旧 Compose 仍指向同一组持久卷与数据库路径。旧应用会在新镜像构建期间继续服务；随后脚本短暂停止唯一写入实例，依次迁移、审计、启动，并要求容器健康状态及健康端点 JSON 都通过。默认宿主机备份目录是仓库同级的 `my-ledger-deploy-backups`；脚本首次创建它时权限为 `0700`，所有新备份文件权限为 `0600`。可用 `DEPLOY_BACKUP_EXPORT_DIR` 指向另一个专用目录或持久磁盘；若该目录已存在，脚本不会擅自修改权限，但会要求它已禁止 group/other 访问。备份目录不能位于仓库、仓库的子目录、文件系统根目录或仓库的任一祖先目录，并应另行加密同步到不同服务器或对象存储。若要同时验证 nginx/TLS，可将 `DEPLOY_HEALTHCHECK_URL` 设为公网健康端点。
+
+迁移器在 schema 发生变化前还会向 `/app/backups` 写入一份通过 `integrity_check` 的自动备份；这不能代替更新脚本产生的宿主机副本或异地备份。任何 checksum 不一致、未知版本、缺表、外键错误或完整性错误都会终止迁移。脚本不会自动 reset、删除数据或执行可能与新 schema 不兼容的旧版本回滚。不要运行两个 app 副本做滚动更新；SQLite 模式采用短暂停机替换单实例。

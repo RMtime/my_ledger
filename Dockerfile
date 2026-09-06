@@ -16,9 +16,9 @@ COPY tsconfig.json ./tsconfig.json
 COPY drizzle ./drizzle
 COPY scripts/migrate.ts ./scripts/migrate.ts
 COPY scripts/audit-data.ts ./scripts/audit-data.ts
-COPY src/db/migrations.ts ./src/db/migrations.ts
-COPY src/modules/ledger/money.ts ./src/modules/ledger/money.ts
-COPY src/modules/shared/time.ts ./src/modules/shared/time.ts
+COPY src ./src
+RUN mkdir -p /app/data /app/backups && chown node:node /app/data /app/backups
+USER node
 CMD ["npm","run","db:migrate"]
 
 FROM node:24-bookworm-slim AS runner
