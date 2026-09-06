@@ -20,7 +20,8 @@
     "test:watch": "vitest",
     "test:mcp": "tsx tests/mcp/roundtrip.ts",
     "test:mcp:http": "tsx tests/mcp/http-roundtrip.ts",
-    "db:migrate": "tsx scripts/migrate.ts",
+    "db:migrate": "node --import tsx scripts/migrate.ts",
+    "db:audit": "node --import tsx scripts/audit-data.ts",
     "db:seed": "tsx scripts/seed.ts",
     "db:backup": "node scripts/backup.mjs",
     "check": "npm run lint && npm run typecheck && npm run test && npm run build"

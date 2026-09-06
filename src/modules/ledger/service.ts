@@ -2,10 +2,20 @@ import { createHash, randomUUID } from "node:crypto";
 import { sqlite } from "@/db/client";
 import { AppError } from "@/modules/shared/errors";
 import type { ActorContext } from "@/modules/identity/types";
-import { createTransactionSchema, transactionFiltersSchema, updateTransactionSchema, type CreateTransactionInput } from "./schemas";
-import { convertHalfUp } from "./money";
+import { createTransactionSchema, isoInstantSchema, transactionFiltersSchema, updateTransactionSchema, type CreateTransactionInput } from "./schemas";
+import { convertHalfUp, isSupportedCurrency } from "./money";
 
 type Row = Record<string, unknown>;
+type FxRow = {
+  base_currency: string;
+  rate: string;
+  base_amount_minor: bigint;
+  rate_date: string;
+  rate_source: string;
+  rate_kind: string;
+};
+type FxInput = NonNullable<CreateTransactionInput["fx"]>;
+const maximumMinorAmount = 999_999_999_999_999n;
 const fields = `t.id,t.kind,t.amount_minor,t.currency,t.occurred_at,t.occurred_timezone,t.time_precision,
   t.category_id,c.name category_name,t.payment_method,t.account_id,a.name account_name,t.channel_id,ch.name channel_name,
   t.merchant,t.note,t.related_transaction_id,t.transfer_group_id,t.transfer_direction,t.source,t.agent_id,
@@ -44,6 +54,52 @@ function getOwned(ownerId: string, id: string) {
     WHERE t.owner_id=? AND t.id=?`).get(ownerId, id) as Row | undefined;
 }
 
+function getFx(transactionId: string) {
+  return sqlite.prepare(`SELECT base_currency,rate,base_amount_minor,rate_date,rate_source,rate_kind
+    FROM transaction_fx WHERE transaction_id=?`).get(transactionId) as FxRow | undefined;
+}
+
+function auditState(transaction: Row | undefined, fx: FxRow | undefined) {
+  return { transaction: serialize(transaction), fx: serialize(fx as unknown as Row | undefined) ?? null };
+}
+
+function ownerBaseCurrency(ownerId: string) {
+  const profile = sqlite.prepare("SELECT base_currency FROM profiles WHERE id=?").get(ownerId) as { base_currency: string } | undefined;
+  if (!profile) throw new AppError("NOT_FOUND", "用户资料不存在", 404);
+  return profile.base_currency.toUpperCase();
+}
+
+function validatedFx(ownerId: string, currency: string, amountMinor: bigint, input: FxInput) {
+  const baseCurrency = ownerBaseCurrency(ownerId);
+  if (!isSupportedCurrency(currency) || !isSupportedCurrency(baseCurrency)) {
+    throw new AppError("VALIDATION_ERROR", "折算快照只支持 HKD、CNY 和 USD", 422);
+  }
+  if (input.base_currency !== baseCurrency) {
+    throw new AppError("VALIDATION_ERROR", `折算目标币种必须是用户本位币 ${baseCurrency}`, 422);
+  }
+  if (currency === baseCurrency) throw new AppError("VALIDATION_ERROR", "本位币账目不需要折算快照", 422);
+  const baseAmountMinor = convertHalfUp(amountMinor, input.rate);
+  if (baseAmountMinor <= 0n || baseAmountMinor > maximumMinorAmount) {
+    throw new AppError("VALIDATION_ERROR", "折算后的金额超出允许范围", 422);
+  }
+  return { ...input, baseCurrency, baseAmountMinor };
+}
+
+function upsertFx(transactionId: string, fx: ReturnType<typeof validatedFx>) {
+  sqlite.prepare(`INSERT INTO transaction_fx (transaction_id,base_currency,rate,base_amount_minor,rate_date,rate_source,rate_kind)
+    VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(transaction_id) DO UPDATE SET base_currency=excluded.base_currency,rate=excluded.rate,
+      base_amount_minor=excluded.base_amount_minor,rate_date=excluded.rate_date,rate_source=excluded.rate_source,rate_kind=excluded.rate_kind`).run(
+    transactionId,
+    fx.baseCurrency,
+    fx.rate,
+    fx.baseAmountMinor,
+    fx.rate_date,
+    fx.rate_source,
+    "manual",
+  );
+}
+
 export function createTransaction(actor: ActorContext, raw: unknown) {
   requirePermission(actor, "transactions:create");
   const parsed = createTransactionSchema.safeParse(raw);
@@ -60,30 +116,28 @@ export function createTransaction(actor: ActorContext, raw: unknown) {
   let result!: { transaction: ReturnType<typeof serialize>; deduplicated: boolean };
   sqlite.exec("BEGIN IMMEDIATE");
   try {
-    let categoryId=input.category_id;
-    assertOwnedReference(actor.ownerId, "categories", categoryId);
+    const refundOriginal = input.kind === "refund" ? validateRefund(actor.ownerId, input) : undefined;
+    const categoryId = input.category_id ?? refundOriginal?.category_id;
+    assertOwnedReference(actor.ownerId, "categories", input.category_id);
     assertOwnedReference(actor.ownerId, "accounts", input.account_id);
     assertOwnedReference(actor.ownerId, "channels", input.channel_id);
-    if (input.kind === "refund") categoryId=categoryId??validateRefund(actor.ownerId, input).category_id;
     const id = randomUUID();
     const timestamp = now();
     sqlite.prepare(`INSERT INTO transactions
       (id,owner_id,kind,amount_minor,currency,occurred_at,occurred_timezone,time_precision,category_id,payment_method,account_id,channel_id,
        merchant,note,related_transaction_id,transfer_group_id,transfer_direction,source,agent_id,idempotency_key,request_hash,version,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      id, actor.ownerId, input.kind, BigInt(input.amount_minor), input.currency, new Date(input.occurred_at).toISOString(), input.occurred_timezone,
+      id, actor.ownerId, input.kind, BigInt(input.amount_minor), input.currency, input.occurred_at, input.occurred_timezone,
       input.time_precision, categoryId ?? null, input.payment_method ?? null, input.account_id ?? null, input.channel_id ?? null,
       input.merchant ?? null, input.note ?? null, input.related_transaction_id ?? null, input.transfer_group_id ?? null, input.transfer_direction ?? null,
       input.source, actor.actorType === "agent" ? actor.actorId : null, input.idempotency_key, requestHash, 1, timestamp, timestamp,
     );
     if (input.fx) {
-      const base = convertHalfUp(BigInt(input.amount_minor), input.fx.rate);
-      sqlite.prepare(`INSERT INTO transaction_fx (transaction_id,base_currency,rate,base_amount_minor,rate_date,rate_source,rate_kind)
-        VALUES (?,?,?,?,?,?,?)`).run(id, input.fx.base_currency.toUpperCase(), input.fx.rate, base, input.fx.rate_date, input.fx.rate_source, "manual");
+      upsertFx(id, validatedFx(actor.ownerId, input.currency, BigInt(input.amount_minor), input.fx));
     }
     const created = serialize(getOwned(actor.ownerId, id));
     sqlite.prepare(`INSERT INTO audit_events (id,owner_id,actor_type,actor_id,operation,transaction_id,after_json,request_id,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?)`).run(randomUUID(), actor.ownerId, actor.actorType, actor.actorId, "transaction.create", id, JSON.stringify(created), actor.requestId, timestamp);
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(randomUUID(), actor.ownerId, actor.actorType, actor.actorId, "transaction.create", id, JSON.stringify(auditState(getOwned(actor.ownerId, id), getFx(id))), actor.requestId, timestamp);
     sqlite.exec("COMMIT");
     result = { transaction: created, deduplicated: false };
   } catch (error) {
@@ -110,8 +164,8 @@ function createTransferPair(actor: ActorContext, input: CreateTransactionInput, 
     const insert=sqlite.prepare(`INSERT INTO transactions
       (id,owner_id,kind,amount_minor,currency,occurred_at,occurred_timezone,time_precision,account_id,note,transfer_group_id,transfer_direction,source,agent_id,idempotency_key,request_hash,version,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    insert.run(outId,actor.ownerId,"transfer",BigInt(input.amount_minor),input.currency,new Date(input.occurred_at).toISOString(),input.occurred_timezone,input.time_precision,input.account_id,input.note??null,groupId,"out",input.source,actor.actorType==="agent"?actor.actorId:null,input.idempotency_key,requestHash,1,timestamp,timestamp);
-    insert.run(inId,actor.ownerId,"transfer",BigInt(input.amount_minor),input.currency,new Date(input.occurred_at).toISOString(),input.occurred_timezone,input.time_precision,input.counterparty_account_id,input.note??null,groupId,"in",input.source,actor.actorType==="agent"?actor.actorId:null,`${input.idempotency_key}:in`,requestHash,1,timestamp,timestamp);
+    insert.run(outId,actor.ownerId,"transfer",BigInt(input.amount_minor),input.currency,input.occurred_at,input.occurred_timezone,input.time_precision,input.account_id,input.note??null,groupId,"out",input.source,actor.actorType==="agent"?actor.actorId:null,input.idempotency_key,requestHash,1,timestamp,timestamp);
+    insert.run(inId,actor.ownerId,"transfer",BigInt(input.amount_minor),input.currency,input.occurred_at,input.occurred_timezone,input.time_precision,input.counterparty_account_id,input.note??null,groupId,"in",input.source,actor.actorType==="agent"?actor.actorId:null,`${input.idempotency_key}:in`,requestHash,1,timestamp,timestamp);
     const pair=[serialize(getOwned(actor.ownerId,outId))!,serialize(getOwned(actor.ownerId,inId))!];
     sqlite.prepare(`INSERT INTO audit_events (id,owner_id,actor_type,actor_id,operation,transaction_id,after_json,request_id,created_at) VALUES (?,?,?,?,?,?,?,?,?)`).run(randomUUID(),actor.ownerId,actor.actorType,actor.actorId,"transfer.create",outId,JSON.stringify(pair),actor.requestId,timestamp);
     sqlite.exec("COMMIT"); response={transaction:pair[0],pair,deduplicated:false};
@@ -164,8 +218,11 @@ export function listTransactions(actor: ActorContext, raw: unknown) {
   }
   if (filters.cursor) {
     try {
-      const [cursorTime, cursorId] = JSON.parse(Buffer.from(filters.cursor, "base64url").toString("utf8")) as [string, string];
-      clauses.push("(t.occurred_at < ? OR (t.occurred_at = ? AND t.id < ?))"); values.push(cursorTime, cursorTime, cursorId);
+      const decoded = JSON.parse(Buffer.from(filters.cursor, "base64url").toString("utf8")) as unknown;
+      if (!Array.isArray(decoded) || decoded.length !== 2 || typeof decoded[1] !== "string") throw new Error("invalid cursor");
+      const cursorTime = isoInstantSchema.safeParse(decoded[0]);
+      if (!cursorTime.success) throw new Error("invalid cursor time");
+      clauses.push("(t.occurred_at < ? OR (t.occurred_at = ? AND t.id < ?))"); values.push(cursorTime.data, cursorTime.data, decoded[1]);
     } catch { throw new AppError("VALIDATION_ERROR", "分页 cursor 不正确", 422); }
   }
   values.push(filters.limit + 1);
@@ -190,7 +247,6 @@ export function updateTransaction(actor: ActorContext, id: string, raw: unknown)
     if (!before || before.deleted_at) throw new AppError("NOT_FOUND", "账目不存在", 404);
     if (Number(before.version) !== parsed.data.version) throw new AppError("VERSION_CONFLICT", "账目已在其他设备修改，请重新加载", 409);
     const merged = { ...before, ...parsed.data } as Row;
-    if (parsed.data.kind && parsed.data.kind !== before.kind) throw new AppError("CONFLICT", "不能直接修改账目类型，请撤销后重新创建", 409);
     if (before.kind === "transfer" && before.transfer_group_id) throw new AppError("CONFLICT", "成组转账不能单独编辑，请撤销后重新创建", 409);
     assertOwnedReference(actor.ownerId, "categories", merged.category_id as string | null);
     assertOwnedReference(actor.ownerId, "accounts", merged.account_id as string | null);
@@ -206,15 +262,31 @@ export function updateTransaction(actor: ActorContext, id: string, raw: unknown)
       const otherRefunds = sqlite.prepare("SELECT COALESCE(SUM(amount_minor),0) total FROM transactions WHERE owner_id=? AND related_transaction_id=? AND kind='refund' AND id<>? AND deleted_at IS NULL").get(actor.ownerId,before.related_transaction_id,id) as {total:bigint};
       if (merged.currency !== original.currency || otherRefunds.total + BigInt(String(merged.amount_minor)) > original.amount_minor) throw new AppError("CONFLICT", "退款总额不能超过原消费且必须保持同币种", 409);
     }
+    const beforeFx = getFx(id);
     const changed = sqlite.prepare(`UPDATE transactions SET kind=?,amount_minor=?,currency=?,occurred_at=?,occurred_timezone=?,time_precision=?,category_id=?,payment_method=?,account_id=?,channel_id=?,merchant=?,note=?,version=version+1,updated_at=? WHERE owner_id=? AND id=? AND version=?`).run(
-      merged.kind, BigInt(String(merged.amount_minor)), merged.currency, new Date(String(merged.occurred_at)).toISOString(), merged.occurred_timezone, merged.time_precision,
+      merged.kind, BigInt(String(merged.amount_minor)), merged.currency, merged.occurred_at, merged.occurred_timezone, merged.time_precision,
       merged.category_id ?? null, merged.payment_method ?? null, merged.account_id ?? null, merged.channel_id ?? null, merged.merchant ?? null, merged.note ?? null,
       now(), actor.ownerId, id, parsed.data.version,
     );
     if (!changed.changes) throw new AppError("VERSION_CONFLICT", "账目已在其他设备修改，请重新加载", 409);
+    const amountChanged = parsed.data.amount_minor !== undefined && BigInt(parsed.data.amount_minor) !== BigInt(String(before.amount_minor));
+    const currencyChanged = parsed.data.currency !== undefined && parsed.data.currency !== before.currency;
+    const occurredAtChanged = parsed.data.occurred_at !== undefined && parsed.data.occurred_at !== before.occurred_at;
+    if (parsed.data.fx) {
+      upsertFx(id, validatedFx(actor.ownerId, String(merged.currency), BigInt(String(merged.amount_minor)), parsed.data.fx));
+    } else if (beforeFx && (amountChanged || currencyChanged || occurredAtChanged)) {
+      const baseCurrency = ownerBaseCurrency(actor.ownerId);
+      if (String(merged.currency) === baseCurrency || currencyChanged || occurredAtChanged || beforeFx.base_currency !== baseCurrency) {
+        sqlite.prepare("DELETE FROM transaction_fx WHERE transaction_id=?").run(id);
+      } else {
+        const baseAmountMinor = convertHalfUp(BigInt(String(merged.amount_minor)), beforeFx.rate);
+        if (baseAmountMinor <= 0n || baseAmountMinor > maximumMinorAmount) throw new AppError("VALIDATION_ERROR", "折算后的金额超出允许范围", 422);
+        sqlite.prepare("UPDATE transaction_fx SET base_amount_minor=? WHERE transaction_id=?").run(baseAmountMinor, id);
+      }
+    }
     const after = serialize(getOwned(actor.ownerId, id));
     sqlite.prepare(`INSERT INTO audit_events (id,owner_id,actor_type,actor_id,operation,transaction_id,before_json,after_json,request_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .run(randomUUID(), actor.ownerId, actor.actorType, actor.actorId, "transaction.update", id, JSON.stringify(serialize(before)), JSON.stringify(after), actor.requestId, now());
+      .run(randomUUID(), actor.ownerId, actor.actorType, actor.actorId, "transaction.update", id, JSON.stringify(auditState(before, beforeFx)), JSON.stringify(auditState(getOwned(actor.ownerId, id), getFx(id))), actor.requestId, now());
     sqlite.exec("COMMIT");
     return after;
   } catch (error) { sqlite.exec("ROLLBACK"); throw error; }

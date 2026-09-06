@@ -10,6 +10,8 @@ docker compose exec app node scripts/backup.mjs /app/backups/ledger-$(date +%F).
 
 脚本会对副本执行 `PRAGMA integrity_check`，并输出账目数量和按币种、类型汇总。记录输出，再把备份加密同步到不同故障域。
 
+`npm run db:migrate`（容器中为 `docker compose run --rm migrate`）会在修改已有 schema 前自动创建 `pre-migrate-v*.db`，并验证副本完整性。迁移备份是额外回滚点，不替代定期在线备份和异地副本。
+
 ## 隔离恢复验证
 
 1. 停止一个不承载生产流量的临时 app 容器。

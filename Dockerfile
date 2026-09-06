@@ -10,6 +10,17 @@ COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
+FROM deps AS migrator
+WORKDIR /app
+COPY tsconfig.json ./tsconfig.json
+COPY drizzle ./drizzle
+COPY scripts/migrate.ts ./scripts/migrate.ts
+COPY scripts/audit-data.ts ./scripts/audit-data.ts
+COPY src/db/migrations.ts ./src/db/migrations.ts
+COPY src/modules/ledger/money.ts ./src/modules/ledger/money.ts
+COPY src/modules/shared/time.ts ./src/modules/shared/time.ts
+CMD ["npm","run","db:migrate"]
+
 FROM node:24-bookworm-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0 DATABASE_PATH=/app/data/ledger.db

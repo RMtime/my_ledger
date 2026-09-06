@@ -1,7 +1,26 @@
 services:
+  migrate:
+    build:
+      context: .
+      target: migrator
+    restart: "no"
+    env_file: .env.production
+    environment:
+      DATABASE_PATH: /app/data/ledger.db
+      MIGRATION_BACKUP_DIR: /app/backups
+      NODE_ENV: production
+    volumes:
+      - ledger-data:/app/data
+      - ledger-backups:/app/backups
+    security_opt:
+      - no-new-privileges:true
+
   app:
     build: .
     restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     env_file: .env.production
     environment:
       DATABASE_PATH: /app/data/ledger.db

@@ -1,5 +1,9 @@
 const exponents: Record<string, number> = { HKD: 2, CNY: 2, USD: 2 };
 
+export function isSupportedCurrency(currency: string) {
+  return Object.hasOwn(exponents, currency.toUpperCase());
+}
+
 export function parseMajorAmount(value: string, currency: string): string {
   const exponent = exponents[currency.toUpperCase()];
   if (exponent === undefined) throw new Error(`不支持币种 ${currency}`);
@@ -15,8 +19,10 @@ export function parseMajorAmount(value: string, currency: string): string {
 export function formatMinor(value: string | bigint, currency: string) {
   const exponent = exponents[currency] ?? 2;
   const amount = typeof value === "bigint" ? value : BigInt(value);
+  const sign = amount < 0n ? "-" : "";
+  const absolute = amount < 0n ? -amount : amount;
   const scale = 10n ** BigInt(exponent);
-  return `${currency} ${(amount / scale).toString()}.${(amount % scale).toString().padStart(exponent, "0")}`;
+  return `${currency} ${sign}${(absolute / scale).toString()}.${(absolute % scale).toString().padStart(exponent, "0")}`;
 }
 
 export function convertHalfUp(amountMinor: bigint, rate: string): bigint {
