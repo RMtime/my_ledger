@@ -1,10 +1,8 @@
 import { DateTime } from "luxon";
 import { requireUnlockedUser } from "@/modules/vault/http";
 import { getProfile } from "@/modules/profile/service";
-import { getSummary } from "@/modules/analytics/service";
+import { ensureSummaryFx, getSummary } from "@/modules/analytics/service";
 import { AppError, errorResponse } from "@/modules/shared/errors";
-import { listTransactions } from "@/modules/ledger/service";
-import { ensureFxSnapshots, type FxTransaction } from "@/modules/fx/service";
 
 export const dynamic = "force-dynamic";
 const monthPattern = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -20,11 +18,7 @@ export async function GET(request: Request) {
     if (!["HKD", "CNY", "USD"].includes(displayCurrency)) throw new AppError("VALIDATION_ERROR", "display_currency 不正确", 422);
     const categoryLevel = params.get("category_level") === "leaf" ? "leaf" : "top";
     const startUtc = start.toUTC().toISO()!; const endUtc = end.toUTC().toISO()!;
-    if (currencyMode === "base" && actor.vaultKey) {
-      const rows: FxTransaction[] = []; let cursor: string | null = null;
-      do { const page = listTransactions(actor, { start: startUtc, end: endUtc, limit: 100, cursor: cursor ?? undefined }); rows.push(...page.items as FxTransaction[]); cursor = page.next_cursor; } while (cursor);
-      await ensureFxSnapshots(actor, rows, displayCurrency);
-    }
+    await ensureSummaryFx(actor, { start: startUtc, end: endUtc, currency_mode: currencyMode, display_currency: displayCurrency });
     const summary = getSummary(actor, { start: startUtc, end: endUtc, group_by: groupBy, currency_mode: currencyMode, display_currency: displayCurrency, category_level: categoryLevel });
     return Response.json({ ...summary, period: { ...summary.period, month, timezone }, currency_mode: currencyMode, display_currency: displayCurrency, category_level: categoryLevel }, { headers: { "cache-control": "no-store" } });
   } catch (error) { return errorResponse(error); }

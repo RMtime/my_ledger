@@ -459,7 +459,7 @@ export function listTransactions(actor: ActorContext, raw: unknown) {
   const values: unknown[] = [actor.ownerId];
   const start = filters.start ?? filters.date_from;
   const end = filters.end ?? filters.date_to;
-  for (const [column, value] of [["occurred_at >=", start], ["occurred_at <", end], ["kind =", filters.kind], ["currency =", filters.currency], ["category_id =", filters.category_id], ["payment_method =", filters.payment_method], ["account_id =", filters.account_id], ["channel_id =", filters.channel_id]] as const) {
+  for (const [column, value] of [["occurred_at >=", start], ["occurred_at <", end], ["kind =", filters.kind], ["currency =", filters.currency], ["category_id =", filters.category_id], ["payment_method =", filters.payment_method], ["payment_method_id =", filters.payment_method_id], ["account_id =", filters.account_id], ["channel_id =", filters.channel_id]] as const) {
     if (value) { clauses.push(`t.${column} ?`); values.push(value); }
   }
   if (filters.search) {

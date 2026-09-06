@@ -9,7 +9,7 @@ import { createTransaction, getTransaction, listTransactions } from "@/modules/l
 import { updateProfile } from "@/modules/profile/service";
 import { ensureFxSnapshot, readFxSnapshot } from "@/modules/fx/service";
 import { parseDecimal } from "@/modules/fx/rational";
-import { getSummary } from "@/modules/analytics/service";
+import { ensureSummaryFx, getSummary } from "@/modules/analytics/service";
 
 const owner = "00000000-0000-4000-8000-0000000000c1";
 let actor: ActorContext;
@@ -71,6 +71,16 @@ describe("encrypted user vault", () => {
     expect(getSummary(actor, { ...range, group_by: "category", category_level: "top" }).groups[0]).toMatchObject({ label: "家庭", currency: "HKD", net_expense_minor: "7800" });
     expect(getSummary(actor, { ...range, group_by: "category", category_level: "leaf" }).groups[0]).toMatchObject({ label: "日用品" });
   });
+  it("fills missing FX through the shared summary helper so MCP and the web agree", async () => {
+    const transaction = createTransaction(actor, { kind: "expense", amount_minor: "5000", currency: "USD", occurred_at: "2026-11-04T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", idempotency_key: randomUUID(), source: "manual" }).transaction as Record<string, string>;
+    const range = { start: "2026-11-04T00:00:00.000Z", end: "2026-11-05T00:00:00.000Z", currency_mode: "base" as const, display_currency: "HKD" as const };
+    expect(getSummary(actor, range).base).toMatchObject({ missing_fx_count: 1, coverage: 0 });
+    const fetcher = async () => ({ sourceDate: "2026-11-03", ratesToHkd: { CNY: parseDecimal("1.1"), USD: parseDecimal("7.8") }, rawHash: "c".repeat(64) });
+    await ensureSummaryFx(actor, range, fetcher);
+    expect(getSummary(actor, range).base).toMatchObject({ currency: "HKD", expense_minor: "39000", missing_fx_count: 0, coverage: 1 });
+    expect(readFxSnapshot(actor, transaction.id, "HKD")?.status).toBe("available");
+  });
+
   it("keeps a second user's ciphertext, names, and transaction IDs isolated", async () => {
     const secondOwner = "00000000-0000-4000-8000-0000000000c2"; const now = new Date().toISOString(); sqlite.prepare("INSERT INTO profiles (id,auth_subject,email,timezone,base_currency,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(secondOwner, "vault-test-2", "partner@example.com", "Asia/Hong_Kong", "HKD", 1, now, now);
     const base = userActor(secondOwner, "vault-test-2"); const initialized = await initializeVault(base, "partner private passphrase"); const session = resolveVaultSession(initialized.token, secondOwner); if (!session) throw new Error("missing second vault session"); const second = { ...base, vaultKey: session.key, vaultKeyVersion: session.keyVersion };

@@ -5,9 +5,11 @@ import { z } from "zod";
 import { isoInstantSchema } from "@/modules/ledger/schemas";
 import { listTransactions } from "@/modules/ledger/service";
 import { readEncryptedEntity, vaultInitialized } from "@/modules/vault/entities";
-import { readFxSnapshot } from "@/modules/fx/service";
+import { ensureFxSnapshots, readFxSnapshot, type FxTransaction } from "@/modules/fx/service";
+import { fetchHkmaRates } from "@/modules/fx/hkma";
+import { getProfile } from "@/modules/profile/service";
 
-const allowedGroups = { category: "COALESCE(c.name,'未分类')", payment_method: "COALESCE(t.payment_method,'未指定')", account: "COALESCE(a.name,'未指定')", channel: "COALESCE(ch.name,'未指定')", merchant: "COALESCE(t.merchant,'未指定')" } as const;
+const allowedGroups = { category: "COALESCE(c.name,'未分类')", payment_method: "COALESCE(pm.name,t.payment_method,'未指定')", account: "COALESCE(a.name,'未指定')", channel: "COALESCE(ch.name,'未指定')", merchant: "COALESCE(t.merchant,'未指定')" } as const;
 const summaryInputSchema = z.object({
   start: isoInstantSchema,
   end: isoInstantSchema,
@@ -16,6 +18,20 @@ const summaryInputSchema = z.object({
   display_currency: z.enum(["HKD", "CNY", "USD"]).optional(),
   category_level: z.enum(["top", "leaf"]).optional(),
 }).refine((value) => value.start < value.end, { message: "统计区间不正确" });
+
+// 统一换算视图必须先补齐汇率快照，否则 base 永远是 missing。
+// 网页路由与 MCP get_summary 共用这一个入口，避免两边口径漂移。
+export async function ensureSummaryFx(actor: ActorContext, input: { start: string; end: string; currency_mode?: "original" | "base"; display_currency?: string }, fetcher: typeof fetchHkmaRates = fetchHkmaRates) {
+  if (input.currency_mode !== "base" || !actor.vaultKey) return;
+  const profile = getProfile(actor);
+  const target = String(input.display_currency ?? profile?.base_currency ?? "HKD").toUpperCase();
+  const rows: FxTransaction[] = []; let cursor: string | null = null;
+  do {
+    const page = listTransactions(actor, { start: input.start, end: input.end, limit: 100, cursor: cursor ?? undefined });
+    rows.push(...page.items as FxTransaction[]); cursor = page.next_cursor;
+  } while (cursor);
+  await ensureFxSnapshots(actor, rows, target, fetcher);
+}
 
 export function getSummary(actor: ActorContext, input: { start: string; end: string; group_by?: keyof typeof allowedGroups; currency_mode?: "original" | "base"; display_currency?: "HKD" | "CNY" | "USD"; category_level?: "top" | "leaf" }) {
   if (!actor.permissions.includes("analytics:read")) throw new AppError("FORBIDDEN", "当前凭证不能读取统计", 403);
@@ -49,13 +65,14 @@ export function getSummary(actor: ActorContext, input: { start: string; end: str
     SUM(CASE WHEN t.kind='expense' THEN t.amount_minor WHEN t.kind='refund' THEN -t.amount_minor ELSE 0 END) net_expense_minor,COUNT(*) count
     FROM transactions t LEFT JOIN categories c ON c.owner_id=t.owner_id AND c.id=t.category_id
     LEFT JOIN accounts a ON a.owner_id=t.owner_id AND a.id=t.account_id LEFT JOIN channels ch ON ch.owner_id=t.owner_id AND ch.id=t.channel_id
+    LEFT JOIN payment_methods pm ON pm.owner_id=t.owner_id AND pm.id=t.payment_method_id
     WHERE t.owner_id=? AND t.occurred_at>=? AND t.occurred_at<? AND t.deleted_at IS NULL AND t.kind IN ('expense','refund')
     GROUP BY label,t.currency ORDER BY ABS(net_expense_minor) DESC LIMIT 30`).all(actor.ownerId, filters.start, filters.end) as Array<Record<string, bigint | string | number>>;
   return {
     period: { start: filters.start, end: filters.end, semantics: "[start,end)", timezone: "由调用者将用户时区边界转换为 UTC" },
     currencies,
     base: fx ? { currency: String(fx.base_currency), expense_minor: String(fx.expense_minor ?? 0), refund_minor: String(fx.refund_minor ?? 0), income_minor: String(fx.income_minor ?? 0), net_expense_minor: (BigInt(fx.expense_minor ?? 0) - BigInt(fx.refund_minor ?? 0)).toString(), missing_fx_count: Number(fx.missing_count), coverage: Number(fx.total_count) ? (Number(fx.total_count) - Number(fx.missing_count)) / Number(fx.total_count) : 1 } : null,
-    groups: groups.map((g) => ({ ...g, net_expense_minor: String(g.net_expense_minor), count: Number(g.count) })),
+    groups: groups.map((g) => ({ label: String(g.label), currency: String(g.currency), net_expense_minor: String(g.net_expense_minor), count: Number(g.count) })),
     missing_fx_transaction_ids: [] as string[],
   };
 }
