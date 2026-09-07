@@ -17,8 +17,9 @@ const inputHash = (value: unknown) => createHash("sha256").update(JSON.stringify
 type Operation = "extract" | "report";
 type CachedCompletion = { model: string; text: string };
 type CompletionUsage = { prompt_tokens?: number; completion_tokens?: number };
+type CompletionContent = string | null | Array<{ type?: string; text?: string }>;
 type CompletionPayload = {
-  choices?: Array<{ finish_reason?: string; message?: { content?: string | null } }>;
+  choices?: Array<{ finish_reason?: string; message?: { content?: CompletionContent; reasoning_content?: unknown; reasoning_details?: unknown } }>;
   usage?: CompletionUsage;
 };
 
@@ -29,8 +30,58 @@ function positiveLimit(name: string, fallback: number) {
 
 function operationTokenLimit(operation: Operation) {
   return operation === "extract"
-    ? positiveLimit("AI_EXTRACT_MAX_TOKENS", 2_048)
-    : positiveLimit("AI_REPORT_MAX_TOKENS", 4_096);
+    ? positiveLimit("AI_EXTRACT_MAX_TOKENS", 8_192)
+    : positiveLimit("AI_REPORT_MAX_TOKENS", 16_384);
+}
+
+function contentText(content: CompletionContent | undefined) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part?.type !== "reasoning" && part?.type !== "thinking")
+    .map((part) => typeof part?.text === "string" ? part.text : "")
+    .join("");
+}
+
+function jsonObjects(text: string) {
+  const objects: string[] = []; let start = -1; let depth = 0; let quoted = false; let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"') { quoted = true; continue; }
+    if (character === "{") { if (depth === 0) start = index; depth += 1; }
+    else if (character === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) { objects.push(text.slice(start, index + 1)); start = -1; }
+    }
+  }
+  return objects;
+}
+
+function structuredFinalText(content: CompletionContent | undefined) {
+  let text = contentText(content).trim();
+  // MiniMax can embed CoT in <think> blocks unless reasoning_split is honored.
+  // DeepSeek returns it in reasoning_content. Neither field is read, persisted,
+  // or returned; this is a defensive cleanup for compatible gateways.
+  text = text
+    .replace(/<think(?:ing)?\b[^>]*>[\s\S]*?<\/think(?:ing)?>/gi, "")
+    .replace(/<analysis\b[^>]*>[\s\S]*?<\/analysis>/gi, "")
+    .trim();
+  if (/<\/?(?:think|thinking|analysis)\b/i.test(text)) return undefined;
+  text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const candidates = [text, ...jsonObjects(text).reverse()];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return JSON.stringify(parsed);
+    } catch { /* try the next complete object */ }
+  }
+  return undefined;
 }
 
 function addUsage(total: CompletionUsage | undefined, next: CompletionUsage | undefined): CompletionUsage | undefined {
@@ -78,36 +129,42 @@ async function complete(actor: ActorContext, operation: Operation, system: strin
   if (reservation.cached) {
     const cached = readEncryptedEntity<CachedCompletion>(actor, "ai_invocation_result", reservation.id);
     if (!cached) throw new AppError("MIGRATION_NOT_READY", "AI 幂等结果密文缺失", 409);
-    return { ...cached, reservationId: reservation.id, cached: true, usage: undefined };
+    const text = structuredFinalText(cached.text);
+    if (!text) throw new AppError("AI_PROVIDER_FAILED", "AI 缓存结果格式不正确", 502);
+    return { ...cached, text, reservationId: reservation.id, cached: true, usage: undefined };
   }
   let accumulatedUsage: CompletionUsage | undefined;
   try {
     sqlite.prepare("UPDATE ai_invocations SET status='running',updated_at=? WHERE id=?").run(new Date().toISOString(), reservation.id);
-    const baseMaxTokens = operationTokenLimit(operation); const maxAttempts = provider === "deepseek" ? 2 : 1;
-    let lastFailure: "empty" | "truncated" = "empty";
+    const baseMaxTokens = operationTokenLimit(operation); const maxAttempts = 2;
+    let lastFailure: "empty" | "truncated" | "invalid_format" = "empty";
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const retryInstruction = attempt === 0 ? "" : "\n这是一次重试。直接输出一个完整 JSON 对象，不要输出解释、Markdown 或空白占位。";
       const messages = [{ role: "system", content: `${system}${retryInstruction}` }, { role: "user", content: user }];
       const body: Record<string, unknown> = { model: config.model, messages };
       if (provider === "deepseek") {
-        // V4 defaults to thinking mode. These tasks only need a small, validated JSON object;
-        // disabling reasoning keeps the token budget for the final answer and avoids length-only completions.
-        body.thinking = { type: "disabled" };
+        // Omit thinking/reasoning_effort so DeepSeek uses its provider default.
+        // reasoning_content remains separate from the final content and is ignored.
         body.max_tokens = baseMaxTokens * (attempt + 1);
         body.response_format = { type: "json_object" };
-      } else body.max_completion_tokens = baseMaxTokens;
+      } else {
+        // This does not change MiniMax's reasoning effort; it asks the compatible
+        // API to keep the default reasoning out of the final content field.
+        body.reasoning_split = true;
+        body.max_completion_tokens = baseMaxTokens * (attempt + 1);
+      }
       const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), positiveLimit("AI_REQUEST_TIMEOUT_MS", 45_000));
       let response: Response;
       try {
         response = await fetch(endpoint, { method: "POST", signal: controller.signal, headers: { "content-type": "application/json", authorization: `Bearer ${config.key}` }, body: JSON.stringify(body) });
       } finally { clearTimeout(timeout); }
       if (!response.ok) { finishInvocation(reservation.id, "failed", `http_${response.status}`, accumulatedUsage); throw new AppError("AI_PROVIDER_FAILED", "AI 服务拒绝了请求", 502); }
-      const payload = await response.json() as CompletionPayload; const choice = payload.choices?.[0]; const text = choice?.message?.content?.trim(); accumulatedUsage = addUsage(accumulatedUsage, payload.usage);
+      const payload = await response.json() as CompletionPayload; const choice = payload.choices?.[0]; const rawText = contentText(choice?.message?.content).trim(); const text = structuredFinalText(choice?.message?.content); accumulatedUsage = addUsage(accumulatedUsage, payload.usage);
       if (text && choice?.finish_reason !== "length") return { model: config.model, text, reservationId: reservation.id, cached: false, usage: accumulatedUsage };
-      lastFailure = choice?.finish_reason === "length" ? "truncated" : "empty";
+      lastFailure = choice?.finish_reason === "length" ? "truncated" : rawText ? "invalid_format" : "empty";
     }
     finishInvocation(reservation.id, "failed", lastFailure, accumulatedUsage);
-    throw new AppError("AI_PROVIDER_FAILED", "AI 返回为空或被截断，已自动重试一次", 502);
+    throw new AppError("AI_PROVIDER_FAILED", "AI 返回为空、被截断或格式不正确，已自动重试一次", 502);
   } catch (error) {
     if (error instanceof AppError) throw error;
     finishInvocation(reservation.id, "unknown", error instanceof Error ? error.name : "unknown", accumulatedUsage);

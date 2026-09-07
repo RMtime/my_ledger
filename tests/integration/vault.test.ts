@@ -5,7 +5,7 @@ import { userActor, type ActorContext } from "@/modules/identity/types";
 import { initializeVault, rotateVaultPassphrase, unlockVault } from "@/modules/vault/service";
 import { resolveVaultSession } from "@/modules/vault/session";
 import { createMetadata, listMetadata } from "@/modules/ledger/metadata";
-import { createTransaction, getTransaction, listTransactions } from "@/modules/ledger/service";
+import { createTransaction, deleteTransaction, getTransaction, listTransactions, updateTransaction } from "@/modules/ledger/service";
 import { updateProfile } from "@/modules/profile/service";
 import { ensureFxSnapshot, readFxSnapshot } from "@/modules/fx/service";
 import { parseDecimal } from "@/modules/fx/rational";
@@ -35,6 +35,17 @@ describe("encrypted user vault", () => {
     expect(stored).toMatchObject({ amount_minor: 1n, currency: "XXX", occurred_at: "1970-01-01T00:00:00.000Z", merchant: null, note: null });
     expect(String(stored.idempotency_key)).toBe(`enc:${id}`);
     expect(listTransactions(actor, { search: "私密商户" }).items).toEqual([expect.objectContaining({ id, amount_minor: "3800", merchant: "私密商户", payment_method_id: paymentMethodId })]);
+  });
+  it("keeps secure transaction payloads JSON-safe across read, edit, and revoke", () => {
+    const created = createTransaction(actor, { kind: "expense", amount_minor: "4200", currency: "HKD", occurred_at: "2026-09-06T13:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", merchant: "json-safe", idempotency_key: randomUUID(), source: "manual" });
+    const transaction = created.transaction as Record<string, unknown>;
+    const id = String(transaction.id);
+    expect(transaction).toMatchObject({ amount_minor: "4200", refundable_minor: "4200", version: 1 });
+    expect(() => Response.json({ created, detail: getTransaction(actor, id), list: listTransactions(actor, { search: "json-safe" }) })).not.toThrow();
+    const updated = updateTransaction(actor, id, { version: 1, note: "still-json-safe" });
+    expect(updated).toMatchObject({ amount_minor: "4200", refundable_minor: "4200", version: 2 });
+    expect(() => JSON.stringify(updated)).not.toThrow();
+    expect(() => deleteTransaction(actor, id, 2)).not.toThrow();
   });
   it("validates encrypted refunds and supports encrypted transfer pairs", () => {
     const expense = createTransaction(actor, { kind: "expense", amount_minor: "1000", currency: "HKD", occurred_at: "2026-09-07T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", idempotency_key: randomUUID(), source: "manual" }).transaction as { id: string };

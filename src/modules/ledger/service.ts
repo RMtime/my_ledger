@@ -85,7 +85,10 @@ function getOwned(ownerId: string, id: string, actor?: ActorContext) {
   const value = readEncryptedEntity<Row>(actor, "transaction", id);
   if (!value) throw new AppError("CONFLICT", "加密账目缺失，请运行数据审计", 409);
   const materialized = { ...row, ...value };
-  materialized.amount_minor = BigInt(String(value.amount_minor));
+  // Keep materialized secure rows JSON-safe. Arithmetic callers convert these
+  // string API values back to bigint locally instead of leaking bigint across
+  // encryption, audit, MCP, or Response.json boundaries.
+  materialized.amount_minor = String(value.amount_minor);
   const category = value.category_id ? readEncryptedEntity<Row>(actor, "category", String(value.category_id)) : undefined;
   const account = value.account_id ? readEncryptedEntity<Row>(actor, "account", String(value.account_id)) : undefined;
   const channel = value.channel_id ? readEncryptedEntity<Row>(actor, "channel", String(value.channel_id)) : undefined;
@@ -96,7 +99,7 @@ function getOwned(ownerId: string, id: string, actor?: ActorContext) {
   materialized.payment_method_name = payment?.name ?? null;
   materialized.payment_method = value.payment_method ?? payment?.legacy_code ?? null;
   const refunded = secureRelatedTransactions(actor, id).reduce((sum, refund) => sum + BigInt(String(refund.amount_minor)), 0n);
-  materialized.refundable_minor = value.kind === "expense" ? BigInt(String(value.amount_minor)) - refunded : 0n;
+  materialized.refundable_minor = (value.kind === "expense" ? BigInt(String(value.amount_minor)) - refunded : 0n).toString();
   return materialized;
 }
 
