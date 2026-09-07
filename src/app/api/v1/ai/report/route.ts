@@ -12,4 +12,14 @@ export async function POST(request: Request) { try { assertSameOrigin(request); 
       label: dimension === "merchant" ? `商家 ${index + 1}` : group.label,
       currency: group.currency, value_minor: group.net_expense_minor, count: group.count,
     }));
-    const snapshot = { metrics: [...summary.currencies.flatMap((c, i) => [{ metric_id: `currency_${i}_expense`, currency: c.currency, value_minor: c.expense_minor }, { metric_id: `currency_${i}_net`, currency: c.currency, value_minor: c.net_expense_minor }]), ...groupMetrics], limitations: { missing_fx_count: summary.base?.missing_fx_count ?? 0, merchant_labels_withheld: dimension === "merchant" }, period: summary.period }; return Response.json(await createReport(actor, snapshot, `${body.start}/${body.end}`, body)); } catch (error) { return errorResponse(error); } }
+    const incomeGroupMetrics = summary.income_groups.map((group, index) => ({
+      metric_id: `income_group_${index}`, dimension,
+      label: dimension === "merchant" ? `收入来源 ${index + 1}` : group.label,
+      currency: group.currency, value_minor: group.income_minor, count: group.count,
+    }));
+    const currencyMetrics = summary.currencies.flatMap((currency, index) => [
+      { metric_id: `currency_${index}_expense`, currency: currency.currency, value_minor: currency.expense_minor },
+      { metric_id: `currency_${index}_income`, currency: currency.currency, value_minor: currency.income_minor },
+      { metric_id: `currency_${index}_balance`, currency: currency.currency, value_minor: currency.net_cashflow_minor },
+    ]);
+    const snapshot = { metrics: [...currencyMetrics, ...groupMetrics, ...incomeGroupMetrics], limitations: { missing_fx_count: summary.base?.missing_fx_count ?? 0, merchant_labels_withheld: dimension === "merchant" }, period: summary.period }; return Response.json(await createReport(actor, snapshot, `${body.start}/${body.end}`, body)); } catch (error) { return errorResponse(error); } }

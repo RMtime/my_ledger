@@ -46,6 +46,7 @@ export function getSummary(actor: ActorContext, input: { start: string; end: str
   const currencies = rows.map((r) => ({
     currency: r.currency, expense_minor: String(r.expense_minor), refund_minor: String(r.refund_minor), income_minor: String(r.income_minor),
     net_expense_minor: (BigInt(r.expense_minor) - BigInt(r.refund_minor)).toString(), transaction_count: Number(r.transaction_count),
+    net_cashflow_minor: (BigInt(r.income_minor) + BigInt(r.refund_minor) - BigInt(r.expense_minor)).toString(),
   }));
   const fx = sqlite.prepare(`SELECT p.base_currency,
     SUM(CASE WHEN t.kind='expense' THEN COALESCE(f.base_amount_minor, CASE WHEN t.currency=p.base_currency THEN t.amount_minor END) ELSE 0 END) expense_minor,
@@ -64,11 +65,18 @@ export function getSummary(actor: ActorContext, input: { start: string; end: str
     LEFT JOIN payment_methods pm ON pm.owner_id=t.owner_id AND pm.id=t.payment_method_id
     WHERE t.owner_id=? AND t.occurred_at>=? AND t.occurred_at<? AND t.deleted_at IS NULL AND t.kind IN ('expense','refund')
     GROUP BY label,t.currency ORDER BY ABS(net_expense_minor) DESC LIMIT 30`).all(actor.ownerId, filters.start, filters.end) as Array<Record<string, bigint | string | number>>;
+  const incomeGroups = sqlite.prepare(`SELECT ${groupExpression} label,t.currency,SUM(t.amount_minor) income_minor,COUNT(*) count
+    FROM transactions t LEFT JOIN categories c ON c.owner_id=t.owner_id AND c.id=t.category_id
+    LEFT JOIN accounts a ON a.owner_id=t.owner_id AND a.id=t.account_id LEFT JOIN channels ch ON ch.owner_id=t.owner_id AND ch.id=t.channel_id
+    LEFT JOIN payment_methods pm ON pm.owner_id=t.owner_id AND pm.id=t.payment_method_id
+    WHERE t.owner_id=? AND t.occurred_at>=? AND t.occurred_at<? AND t.deleted_at IS NULL AND t.kind='income'
+    GROUP BY label,t.currency ORDER BY income_minor DESC LIMIT 30`).all(actor.ownerId, filters.start, filters.end) as Array<Record<string, bigint | string | number>>;
   return {
     period: { start: filters.start, end: filters.end, semantics: "[start,end)", timezone: "由调用者将用户时区边界转换为 UTC" },
     currencies,
-    base: fx ? { currency: String(fx.base_currency), expense_minor: String(fx.expense_minor ?? 0), refund_minor: String(fx.refund_minor ?? 0), income_minor: String(fx.income_minor ?? 0), net_expense_minor: (BigInt(fx.expense_minor ?? 0) - BigInt(fx.refund_minor ?? 0)).toString(), missing_fx_count: Number(fx.missing_count), coverage: Number(fx.total_count) ? (Number(fx.total_count) - Number(fx.missing_count)) / Number(fx.total_count) : 1 } : null,
+    base: fx ? { currency: String(fx.base_currency), expense_minor: String(fx.expense_minor ?? 0), refund_minor: String(fx.refund_minor ?? 0), income_minor: String(fx.income_minor ?? 0), net_expense_minor: (BigInt(fx.expense_minor ?? 0) - BigInt(fx.refund_minor ?? 0)).toString(), net_cashflow_minor: (BigInt(fx.income_minor ?? 0) + BigInt(fx.refund_minor ?? 0) - BigInt(fx.expense_minor ?? 0)).toString(), missing_fx_count: Number(fx.missing_count), coverage: Number(fx.total_count) ? (Number(fx.total_count) - Number(fx.missing_count)) / Number(fx.total_count) : 1 } : null,
     groups: groups.map((g) => ({ label: String(g.label), currency: String(g.currency), net_expense_minor: String(g.net_expense_minor), count: Number(g.count) })),
+    income_groups: incomeGroups.map((g) => ({ label: String(g.label), currency: String(g.currency), income_minor: String(g.income_minor), count: Number(g.count) })),
     missing_fx_transaction_ids: [] as string[],
   };
 }
@@ -79,6 +87,7 @@ function getSecureSummary(actor: ActorContext, filters: z.infer<typeof summaryIn
   const baseCurrency = String(filters.display_currency ?? profile.base_currency ?? "HKD").toUpperCase();
   const currencies = new Map<string, { expense: bigint; refund: bigint; income: bigint; count: number }>();
   const groups = new Map<string, { currency: string; net: bigint; count: number }>();
+  const incomeGroups = new Map<string, { currency: string; income: bigint; count: number }>();
   let baseExpense = 0n; let baseRefund = 0n; let baseIncome = 0n; let missing = 0; let baseCount = 0; const missingIds: string[] = [];
   for (const row of rows) {
     const kind = String(row.kind); if (kind === "transfer") continue;
@@ -99,7 +108,17 @@ function getSecureSummary(actor: ActorContext, filters: z.infer<typeof summaryIn
     if (kind === "expense" || kind === "refund") {
       const groupAmount = filters.currency_mode === "base" ? converted : amount;
       if (groupAmount !== undefined) { const groupCurrency = filters.currency_mode === "base" ? baseCurrency : currency; const group = groups.get(`${label}\u0000${groupCurrency}`) ?? { currency: groupCurrency, net: 0n, count: 0 }; group.net += kind === "expense" ? groupAmount : -groupAmount; group.count += 1; groups.set(`${label}\u0000${groupCurrency}`, group); }
+    } else if (kind === "income") {
+      const groupAmount = filters.currency_mode === "base" ? converted : amount;
+      if (groupAmount !== undefined) { const groupCurrency = filters.currency_mode === "base" ? baseCurrency : currency; const group = incomeGroups.get(`${label}\u0000${groupCurrency}`) ?? { currency: groupCurrency, income: 0n, count: 0 }; group.income += groupAmount; group.count += 1; incomeGroups.set(`${label}\u0000${groupCurrency}`, group); }
     }
   }
-  return { period: { start: filters.start, end: filters.end, semantics: "[start,end)", timezone: String(profile.timezone ?? "UTC") }, currencies: [...currencies.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([currency, value]) => ({ currency, expense_minor: value.expense.toString(), refund_minor: value.refund.toString(), income_minor: value.income.toString(), net_expense_minor: (value.expense - value.refund).toString(), transaction_count: value.count })), base: { currency: baseCurrency, expense_minor: baseExpense.toString(), refund_minor: baseRefund.toString(), income_minor: baseIncome.toString(), net_expense_minor: (baseExpense - baseRefund).toString(), missing_fx_count: missing, coverage: baseCount ? (baseCount - missing) / baseCount : 1 }, groups: [...groups.entries()].sort(([, a], [, b]) => b.net === a.net ? 0 : b.net > a.net ? 1 : -1).slice(0, 30).map(([key, value]) => ({ label: key.split("\u0000")[0], currency: value.currency, net_expense_minor: value.net.toString(), count: value.count })), missing_fx_transaction_ids: missingIds };
+  return {
+    period: { start: filters.start, end: filters.end, semantics: "[start,end)", timezone: String(profile.timezone ?? "UTC") },
+    currencies: [...currencies.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([currency, value]) => ({ currency, expense_minor: value.expense.toString(), refund_minor: value.refund.toString(), income_minor: value.income.toString(), net_expense_minor: (value.expense - value.refund).toString(), net_cashflow_minor: (value.income + value.refund - value.expense).toString(), transaction_count: value.count })),
+    base: { currency: baseCurrency, expense_minor: baseExpense.toString(), refund_minor: baseRefund.toString(), income_minor: baseIncome.toString(), net_expense_minor: (baseExpense - baseRefund).toString(), net_cashflow_minor: (baseIncome + baseRefund - baseExpense).toString(), missing_fx_count: missing, coverage: baseCount ? (baseCount - missing) / baseCount : 1 },
+    groups: [...groups.entries()].sort(([, a], [, b]) => b.net === a.net ? 0 : b.net > a.net ? 1 : -1).slice(0, 30).map(([key, value]) => ({ label: key.split("\u0000")[0], currency: value.currency, net_expense_minor: value.net.toString(), count: value.count })),
+    income_groups: [...incomeGroups.entries()].sort(([, a], [, b]) => b.income === a.income ? 0 : b.income > a.income ? 1 : -1).slice(0, 30).map(([key, value]) => ({ label: key.split("\u0000")[0], currency: value.currency, income_minor: value.income.toString(), count: value.count })),
+    missing_fx_transaction_ids: missingIds,
+  };
 }

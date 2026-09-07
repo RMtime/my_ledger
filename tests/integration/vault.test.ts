@@ -82,6 +82,19 @@ describe("encrypted user vault", () => {
     expect(getSummary(actor, { ...range, group_by: "category", category_level: "top" }).groups[0]).toMatchObject({ label: "家庭", currency: "HKD", net_expense_minor: "7800" });
     expect(getSummary(actor, { ...range, group_by: "category", category_level: "leaf" }).groups[0]).toMatchObject({ label: "日用品" });
   });
+  it("separates encrypted income categories and reports the cashflow balance", () => {
+    const expenseTop = createMetadata(actor, "category", { name: "测试生活支出", transaction_kind: "expense" });
+    const expenseLeaf = createMetadata(actor, "category", { name: "测试餐饮", transaction_kind: "expense", parent_id: expenseTop.id });
+    const incomeTop = createMetadata(actor, "category", { name: "测试工作收入", transaction_kind: "income" });
+    const incomeLeaf = createMetadata(actor, "category", { name: "测试工资", transaction_kind: "income", parent_id: incomeTop.id });
+    const common = { currency: "HKD", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute" as const, source: "manual" as const };
+    createTransaction(actor, { ...common, kind: "expense", amount_minor: "219631", category_id: expenseLeaf.id, occurred_at: "2029-01-03T12:00:00+08:00", idempotency_key: randomUUID() });
+    createTransaction(actor, { ...common, kind: "income", amount_minor: "729600", category_id: incomeLeaf.id, occurred_at: "2029-01-04T12:00:00+08:00", idempotency_key: randomUUID() });
+    const summary = getSummary(actor, { start: "2028-12-31T16:00:00.000Z", end: "2029-01-31T16:00:00.000Z", group_by: "category", category_level: "top" });
+    expect(summary.currencies).toEqual([expect.objectContaining({ currency: "HKD", expense_minor: "219631", income_minor: "729600", net_cashflow_minor: "509969" })]);
+    expect(summary.groups).toEqual([expect.objectContaining({ label: "测试生活支出", net_expense_minor: "219631" })]);
+    expect(summary.income_groups).toEqual([expect.objectContaining({ label: "测试工作收入", income_minor: "729600" })]);
+  });
   it("fills missing FX through the shared summary helper so MCP and the web agree", async () => {
     const transaction = createTransaction(actor, { kind: "expense", amount_minor: "5000", currency: "USD", occurred_at: "2026-11-04T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", idempotency_key: randomUUID(), source: "manual" }).transaction as Record<string, string>;
     const range = { start: "2026-11-04T00:00:00.000Z", end: "2026-11-05T00:00:00.000Z", currency_mode: "base" as const, display_currency: "HKD" as const };
