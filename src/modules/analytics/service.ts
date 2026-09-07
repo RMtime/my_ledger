@@ -8,6 +8,7 @@ import { readEncryptedEntity, vaultInitialized } from "@/modules/vault/entities"
 import { ensureFxSnapshots, readFxSnapshot, type FxTransaction } from "@/modules/fx/service";
 import { fetchHkmaRates } from "@/modules/fx/hkma";
 import { getProfile } from "@/modules/profile/service";
+import { isSupportedCurrency } from "@/modules/ledger/money";
 
 const allowedGroups = { category: "COALESCE(c.name,'未分类')", payment_method: "COALESCE(pm.name,t.payment_method,'未指定')", account: "COALESCE(a.name,'未指定')", channel: "COALESCE(ch.name,'未指定')", merchant: "COALESCE(t.merchant,'未指定')" } as const;
 const summaryInputSchema = z.object({
@@ -32,7 +33,7 @@ function summarizeExchanges(rows: Array<Record<string, unknown>>) {
   for (const row of rows) {
     if (row.kind !== "transfer" || row.transfer_direction !== "out" || !row.transfer_group_id || !row.counterparty_amount_minor || !row.counterparty_currency) continue;
     const sourceCurrency = String(row.currency); const targetCurrency = String(row.counterparty_currency);
-    if (sourceCurrency === targetCurrency) continue;
+    if (!isSupportedCurrency(sourceCurrency) || !isSupportedCurrency(targetCurrency) || sourceCurrency === targetCurrency) continue;
     const key = `${sourceCurrency}\u0000${targetCurrency}`;
     const current = totals.get(key) ?? { source_currency: sourceCurrency, target_currency: targetCurrency, source_amount: 0n, target_amount: 0n, count: 0 };
     current.source_amount += BigInt(String(row.amount_minor)); current.target_amount += BigInt(String(row.counterparty_amount_minor)); current.count += 1; totals.set(key, current);

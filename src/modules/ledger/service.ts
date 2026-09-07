@@ -78,6 +78,25 @@ function secureRelatedTransactions(actor: ActorContext, originalId: string, excl
     .filter((row): row is Row => Boolean(row && row.kind === "refund" && !row.deleted_at));
 }
 
+function secureTransferCounterparty(actor: ActorContext, ownerId: string, id: string, value: Row) {
+  if (value.kind !== "transfer" || !value.transfer_group_id) return null;
+  let amount = value.counterparty_amount_minor;
+  let currency = value.counterparty_currency;
+  let accountId = value.counterparty_account_id;
+  if (amount === undefined || amount === null || currency === undefined || currency === null || accountId === undefined || accountId === null) {
+    const peerRow = sqlite.prepare("SELECT id FROM transactions WHERE owner_id=? AND transfer_group_id=? AND id<>? AND deleted_at IS NULL LIMIT 1").get(ownerId, value.transfer_group_id, id) as { id: string } | undefined;
+    const peer = peerRow ? readEncryptedEntity<Row>(actor, "transaction", peerRow.id) : undefined;
+    amount ??= peer?.amount_minor;
+    currency ??= peer?.currency;
+    accountId ??= peer?.account_id;
+  }
+  return {
+    amount: amount === undefined || amount === null ? null : String(amount),
+    currency: currency === undefined || currency === null ? null : String(currency),
+    accountId: accountId === undefined || accountId === null ? null : String(accountId),
+  };
+}
+
 function getOwned(ownerId: string, id: string, actor?: ActorContext) {
   const row = sqlite.prepare(`SELECT ${fields} FROM transactions t
     LEFT JOIN categories c ON c.owner_id=t.owner_id AND c.id=t.category_id
@@ -93,10 +112,16 @@ function getOwned(ownerId: string, id: string, actor?: ActorContext) {
   // string API values back to bigint locally instead of leaking bigint across
   // encryption, audit, MCP, or Response.json boundaries.
   materialized.amount_minor = String(value.amount_minor);
-  if (value.counterparty_amount_minor !== undefined && value.counterparty_amount_minor !== null) materialized.counterparty_amount_minor = String(value.counterparty_amount_minor);
+  // Plaintext transaction rows deliberately contain 1/XXX placeholders. Older
+  // encrypted transfer payloads predate explicit counterparty amount/currency,
+  // so reconstruct them from the encrypted peer and never fall back to SQL fields.
+  const transferCounterparty = secureTransferCounterparty(actor, ownerId, id, value);
+  materialized.counterparty_amount_minor = transferCounterparty?.amount ?? null;
+  materialized.counterparty_currency = transferCounterparty?.currency ?? null;
+  materialized.counterparty_account_id = transferCounterparty?.accountId ?? null;
   const category = value.category_id ? readEncryptedEntity<Row>(actor, "category", String(value.category_id)) : undefined;
   const account = value.account_id ? readEncryptedEntity<Row>(actor, "account", String(value.account_id)) : undefined;
-  const counterpartyAccount = value.counterparty_account_id ? readEncryptedEntity<Row>(actor, "account", String(value.counterparty_account_id)) : undefined;
+  const counterpartyAccount = transferCounterparty?.accountId ? readEncryptedEntity<Row>(actor, "account", transferCounterparty.accountId) : undefined;
   const channel = value.channel_id ? readEncryptedEntity<Row>(actor, "channel", String(value.channel_id)) : undefined;
   const payment = value.payment_method_id ? readEncryptedEntity<Row>(actor, "payment_method", String(value.payment_method_id)) : undefined;
   materialized.category_name = category?.name ?? null;

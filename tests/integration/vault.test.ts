@@ -10,6 +10,7 @@ import { updateProfile } from "@/modules/profile/service";
 import { ensureFxSnapshot, readFxSnapshot } from "@/modules/fx/service";
 import { parseDecimal } from "@/modules/fx/rational";
 import { ensureSummaryFx, getSummary } from "@/modules/analytics/service";
+import { readEncryptedEntity, upsertEncryptedEntity } from "@/modules/vault/entities";
 
 const owner = "00000000-0000-4000-8000-0000000000c1";
 let actor: ActorContext;
@@ -59,6 +60,31 @@ describe("encrypted user vault", () => {
     const summary = getSummary(actor, { start: "2026-09-10T00:00:00.000Z", end: "2026-09-11T00:00:00.000Z" });
     expect(summary.currencies).toEqual([expect.objectContaining({ currency: "CNY", transfer_in_minor: "92000", net_cashflow_minor: "92000" }), expect.objectContaining({ currency: "HKD", transfer_out_minor: "100000", net_cashflow_minor: "-100000" })]);
     expect(summary.exchanges).toEqual([expect.objectContaining({ source_currency: "HKD", target_currency: "CNY", effective_rate: "0.92" })]);
+  });
+  it("reconstructs legacy encrypted transfer counterparts without leaking XXX placeholders", () => {
+    const sourceAccount = listMetadata(actor).accounts.find((account) => account.currency === "HKD");
+    if (!sourceAccount) throw new Error("missing HKD starter account");
+    const targetAccount = createMetadata(actor, "account", { name: "旧转账测试钱包", type: "wallet", currency: "HKD" });
+    const result = createTransaction(actor, { kind: "transfer", amount_minor: "30000", currency: "HKD", occurred_at: "2031-01-10T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", account_id: String(sourceAccount.id), counterparty_account_id: targetAccount.id, idempotency_key: randomUUID(), source: "manual" }) as unknown as { pair: Array<Record<string, string>> };
+    for (const transaction of result.pair) {
+      const payload = readEncryptedEntity<Record<string, unknown>>(actor, "transaction", transaction.id);
+      if (!payload) throw new Error("missing encrypted transfer");
+      const legacyPayload = { ...payload };
+      delete legacyPayload.counterparty_amount_minor;
+      delete legacyPayload.counterparty_currency;
+      upsertEncryptedEntity(actor, "transaction", transaction.id, legacyPayload);
+    }
+    const range = { start: "2031-01-10T00:00:00.000Z", end: "2031-01-11T00:00:00.000Z" };
+    const listed = listTransactions(actor, { ...range, limit: 10 });
+    expect(listed.items).toHaveLength(2);
+    expect(listed.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ currency: "HKD", amount_minor: "30000", counterparty_currency: "HKD", counterparty_amount_minor: "30000" }),
+    ]));
+    expect(JSON.stringify(listed)).not.toContain("XXX");
+    expect(getSummary(actor, range)).toEqual(expect.objectContaining({
+      currencies: [expect.objectContaining({ currency: "HKD", transfer_in_minor: "30000", transfer_out_minor: "30000", net_cashflow_minor: "0" })],
+      exchanges: [],
+    }));
   });
   it("uses the encrypted profile currency for manual FX without exposing the snapshot amount", () => {
     updateProfile(actor, { base_currency: "CNY" });
