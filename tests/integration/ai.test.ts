@@ -9,13 +9,14 @@ import { readEncryptedEntity } from "@/modules/vault/entities";
 const owner = "00000000-0000-4000-8000-0000000000d1";
 let actor: ActorContext;
 let extractCandidate: typeof import("@/modules/ai/provider").extractCandidate;
+let createReport: typeof import("@/modules/ai/provider").createReport;
 
 beforeAll(async () => {
   process.env.DEEPSEEK_API_KEY = "synthetic-test-key"; process.env.DEEPSEEK_MODEL = "synthetic-deepseek-model"; process.env.MINIMAX_API_KEY = "synthetic-test-key"; process.env.MINIMAX_MODEL = "synthetic-minimax-model"; process.env.AI_USER_CONCURRENCY = "1"; process.env.AI_GLOBAL_CONCURRENCY = "4"; process.env.AI_DAILY_ATTEMPT_LIMIT = "20"; process.env.AI_DAILY_SUCCESS_LIMIT = "10";
   const now = new Date().toISOString(); sqlite.prepare("INSERT INTO profiles (id,auth_subject,email,timezone,base_currency,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(owner, "ai-test", "ai@example.com", "Asia/Hong_Kong", "HKD", 1, now, now);
   const base = userActor(owner, "ai-test"); const initialized = await initializeVault(base, "correct horse battery staple"); const session = resolveVaultSession(initialized.token, owner); if (!session) throw new Error("missing vault session"); actor = { ...base, vaultKey: session.key, vaultKeyVersion: session.keyVersion };
   updateAiPreferences(actor, { enabled: true, provider: "deepseek", consent_version: "test-v1" });
-  ({ extractCandidate } = await import("@/modules/ai/provider"));
+  ({ extractCandidate, createReport } = await import("@/modules/ai/provider"));
 });
 
 const candidate = { kind: "expense", amount_minor: "3800", currency: "HKD", occurred_at: "2026-09-06T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", merchant: "synthetic", note: null, payment_method: "cash", confidence: 0.9 };
@@ -75,6 +76,30 @@ describe("AI quota reservation", () => {
       expect(readEncryptedEntity(actor, "ai_invocation_result", invocation.id)).toEqual({ model: "synthetic-minimax-model", text: JSON.stringify(candidate) });
     } finally {
       updateAiPreferences(actor, { enabled: true, provider: "deepseek", consent_version: "test-v1" });
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("always surfaces a supplied actual exchange rate in the AI report", async () => {
+    const providerReport = { observations: [{ metric_id: "currency_0_balance", summary: "原币现金流发生变化。", action: "核对账户余额。" }], limitations: ["未给出 HKD 与 CNY 之间的汇率信息，跨币种余额难以直接合并比较"] };
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(providerReport) } }], usage: { prompt_tokens: 20, completion_tokens: 20 } }), { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const snapshot = {
+      metrics: [
+        { metric_id: "currency_0_balance", metric_type: "net_cashflow", currency: "HKD", value_minor: "-100000" },
+        { metric_id: "exchange_0_rate", metric_type: "actual_exchange_rate", source_currency: "HKD", target_currency: "CNY", source_amount_minor: "100000", target_amount_minor: "92000", effective_rate: "0.92" },
+      ],
+      period: { start: "2030-01-01T00:00:00.000Z", end: "2030-02-01T00:00:00.000Z" },
+    };
+    try {
+      const result = await createReport(actor, snapshot, "2030-01", { test: "actual-exchange-rate" });
+      expect(result.report.observations[0]).toEqual(expect.objectContaining({ metric_id: "exchange_0_rate" }));
+      expect(result.report.limitations).toEqual([]);
+      expect(JSON.stringify(requests[0])).toContain("不得声称这两个币种没有汇率");
+    } finally {
       vi.unstubAllGlobals();
     }
   });

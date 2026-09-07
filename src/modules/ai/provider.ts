@@ -192,12 +192,23 @@ export async function extractCandidate(actor: ActorContext, text: string, refere
 }
 
 export async function createReport(actor: ActorContext, snapshot: unknown, period: string, filters: unknown) {
-  const result = await complete(actor, "report", "根据确定性统计快照给出简体中文观察。只能引用输入中的 metric_id，不复述或重算金额。必须返回严格 JSON: {observations:[{metric_id,summary,action}],limitations:[]}", JSON.stringify(snapshot));
+  const result = await complete(actor, "report", "根据确定性统计快照给出简体中文观察。只能引用输入中的 metric_id，不复述或重算金额。若存在 metric_type=actual_exchange_rate，必须至少引用一个对应 metric_id，并说明这是用户实际换汇金额推导的本期成交汇率；不得声称这两个币种没有汇率。实际成交汇率不等于当前市场汇率或期末余额估值汇率，若缺少后两者可在 limitations 中准确说明。必须返回严格 JSON: {observations:[{metric_id,summary,action}],limitations:[]}", JSON.stringify(snapshot));
   let rawReport: unknown; try { rawReport = JSON.parse(result.text); } catch { finishInvalid(result, "invalid_json"); throw new AppError("AI_PROVIDER_FAILED", "AI 返回格式不正确", 502); }
   const validated = reportSchema.safeParse(rawReport); if (!validated.success) { finishInvalid(result, "schema_invalid"); throw new AppError("AI_PROVIDER_FAILED", "AI 报告未通过结构校验", 502); }
-  const metricIds = new Set((snapshot as { metrics?: Array<{ metric_id?: string }> }).metrics?.map((metric) => metric.metric_id).filter((id): id is string => Boolean(id)) ?? []); if (validated.data.observations.some((item) => !metricIds.has(item.metric_id))) { finishInvalid(result, "unknown_metric"); throw new AppError("AI_PROVIDER_FAILED", "AI 报告引用了不存在的统计指标", 502); }
+  const snapshotMetrics = (snapshot as { metrics?: Array<{ metric_id?: string; metric_type?: string }> }).metrics ?? [];
+  const metricIds = new Set(snapshotMetrics.map((metric) => metric.metric_id).filter((id): id is string => Boolean(id))); if (validated.data.observations.some((item) => !metricIds.has(item.metric_id))) { finishInvalid(result, "unknown_metric"); throw new AppError("AI_PROVIDER_FAILED", "AI 报告引用了不存在的统计指标", 502); }
   finishSuccess(actor, result);
-  const report = validated.data; const snapshotJson = JSON.stringify(snapshot); const createdAt = new Date().toISOString(); const id = randomUUID();
+  const exchangeMetricIds = snapshotMetrics.filter((metric) => metric.metric_type === "actual_exchange_rate" && metric.metric_id).map((metric) => String(metric.metric_id));
+  const hasExchangeObservation = validated.data.observations.some((item) => exchangeMetricIds.includes(item.metric_id));
+  const observations = exchangeMetricIds.length && !hasExchangeObservation
+    ? [{ metric_id: exchangeMetricIds[0], summary: "本期实际成交汇率已纳入统计，可用于解释这次换汇产生的两种原币现金流。", action: "仅将该汇率用于本期已发生换汇；如需合并比较期末余额，仍应使用对应时点的市场估值汇率。" }, ...validated.data.observations].slice(0, 8)
+    : validated.data.observations;
+  const limitations = exchangeMetricIds.length ? validated.data.limitations.filter((item) => {
+    const claimsRateMissing = /(?:未给出|未提供|缺少|没有).{0,24}汇率|汇率.{0,24}(?:未给出|未提供|缺少|没有)/.test(item);
+    const concernsValuationRate = /实时|当前|市场|期末|估值/.test(item);
+    return !claimsRateMissing || concernsValuationRate;
+  }) : validated.data.limitations;
+  const report = { ...validated.data, observations, limitations }; const snapshotJson = JSON.stringify(snapshot); const createdAt = new Date().toISOString(); const id = randomUUID();
   sqlite.prepare("INSERT INTO ai_reports (id,owner_id,period,filters_json,snapshot_json,snapshot_hash,model,prompt_version,report_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(id, actor.ownerId, actor.vaultKey ? "encrypted" : period, actor.vaultKey ? "{}" : JSON.stringify(filters), actor.vaultKey ? "{}" : snapshotJson, actor.vaultKey ? `enc:${id}` : createHash("sha256").update(snapshotJson).digest("hex"), actor.vaultKey ? "encrypted" : result.model, actor.vaultKey ? "encrypted" : "v2", actor.vaultKey ? "{}" : JSON.stringify(report), createdAt);
   if (actor.vaultKey) upsertEncryptedEntity(actor, "ai_report", id, { id, owner_id: actor.ownerId, period, filters, snapshot, model: result.model, report, created_at: createdAt });
   return { id, report, model: result.model, created_at: createdAt, cached_provider_result: result.cached };

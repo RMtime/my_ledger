@@ -19,6 +19,35 @@ const summaryInputSchema = z.object({
   category_level: z.enum(["top", "leaf"]).optional(),
 }).refine((value) => value.start < value.end, { message: "统计区间不正确" });
 
+function formatRatio(numerator: bigint, denominator: bigint, places = 8) {
+  const scale = 10n ** BigInt(places);
+  const scaled = (numerator * scale + denominator / 2n) / denominator;
+  const whole = scaled / scale;
+  const fraction = (scaled % scale).toString().padStart(places, "0").replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole.toString();
+}
+
+function summarizeExchanges(rows: Array<Record<string, unknown>>) {
+  const totals = new Map<string, { source_currency: string; target_currency: string; source_amount: bigint; target_amount: bigint; count: number }>();
+  for (const row of rows) {
+    if (row.kind !== "transfer" || row.transfer_direction !== "out" || !row.transfer_group_id || !row.counterparty_amount_minor || !row.counterparty_currency) continue;
+    const sourceCurrency = String(row.currency); const targetCurrency = String(row.counterparty_currency);
+    if (sourceCurrency === targetCurrency) continue;
+    const key = `${sourceCurrency}\u0000${targetCurrency}`;
+    const current = totals.get(key) ?? { source_currency: sourceCurrency, target_currency: targetCurrency, source_amount: 0n, target_amount: 0n, count: 0 };
+    current.source_amount += BigInt(String(row.amount_minor)); current.target_amount += BigInt(String(row.counterparty_amount_minor)); current.count += 1; totals.set(key, current);
+  }
+  return [...totals.values()].sort((a, b) => `${a.source_currency}:${a.target_currency}`.localeCompare(`${b.source_currency}:${b.target_currency}`)).map((value) => ({
+    source_currency: value.source_currency,
+    target_currency: value.target_currency,
+    source_amount_minor: value.source_amount.toString(),
+    target_amount_minor: value.target_amount.toString(),
+    effective_rate: formatRatio(value.target_amount, value.source_amount),
+    inverse_rate: formatRatio(value.source_amount, value.target_amount),
+    count: value.count,
+  }));
+}
+
 // 统一换算视图必须先补齐汇率快照，否则 base 永远是 missing。
 // 网页路由与 MCP get_summary 共用这一个入口，避免两边口径漂移。
 export async function ensureSummaryFx(actor: ActorContext, input: { start: string; end: string; currency_mode?: "original" | "base"; display_currency?: string }, fetcher: typeof fetchHkmaRates = fetchHkmaRates) {
@@ -35,18 +64,23 @@ export function getSummary(actor: ActorContext, input: { start: string; end: str
   if (!parsed.success) throw new AppError("VALIDATION_ERROR", "统计区间不正确", 422, parsed.error.flatten());
   const filters = parsed.data;
   if (vaultInitialized(actor.ownerId)) return getSecureSummary(actor, filters);
+  const transactionRows = collectTransactions(actor, { start: filters.start, end: filters.end }) as Array<Record<string, unknown>>;
   const rows = sqlite.prepare(`SELECT t.currency,
     SUM(CASE WHEN t.kind='expense' THEN t.amount_minor ELSE 0 END) expense_minor,
     SUM(CASE WHEN t.kind='refund' THEN t.amount_minor ELSE 0 END) refund_minor,
     SUM(CASE WHEN t.kind='income' THEN t.amount_minor ELSE 0 END) income_minor,
-    COUNT(*) transaction_count
+    SUM(CASE WHEN t.kind='transfer' AND t.transfer_direction='in' THEN t.amount_minor ELSE 0 END) transfer_in_minor,
+    SUM(CASE WHEN t.kind='transfer' AND t.transfer_direction='out' THEN t.amount_minor ELSE 0 END) transfer_out_minor,
+    SUM(CASE WHEN t.kind IN ('expense','income','refund') THEN 1 ELSE 0 END) transaction_count,
+    SUM(CASE WHEN t.kind='transfer' THEN 1 ELSE 0 END) transfer_count
     FROM transactions t WHERE t.owner_id=? AND t.occurred_at>=? AND t.occurred_at<? AND t.deleted_at IS NULL
-      AND t.kind IN ('expense','income','refund')
+      AND t.kind IN ('expense','income','refund','transfer')
     GROUP BY t.currency ORDER BY t.currency`).all(actor.ownerId, filters.start, filters.end) as Array<Record<string, bigint | string | number>>;
   const currencies = rows.map((r) => ({
-    currency: r.currency, expense_minor: String(r.expense_minor), refund_minor: String(r.refund_minor), income_minor: String(r.income_minor),
-    net_expense_minor: (BigInt(r.expense_minor) - BigInt(r.refund_minor)).toString(), transaction_count: Number(r.transaction_count),
-    net_cashflow_minor: (BigInt(r.income_minor) + BigInt(r.refund_minor) - BigInt(r.expense_minor)).toString(),
+    currency: String(r.currency), expense_minor: String(r.expense_minor), refund_minor: String(r.refund_minor), income_minor: String(r.income_minor),
+    transfer_in_minor: String(r.transfer_in_minor), transfer_out_minor: String(r.transfer_out_minor),
+    net_expense_minor: (BigInt(r.expense_minor) - BigInt(r.refund_minor)).toString(), transaction_count: Number(r.transaction_count), transfer_count: Number(r.transfer_count),
+    net_cashflow_minor: (BigInt(r.income_minor) + BigInt(r.refund_minor) + BigInt(r.transfer_in_minor) - BigInt(r.expense_minor) - BigInt(r.transfer_out_minor)).toString(),
   }));
   const fx = sqlite.prepare(`SELECT p.base_currency,
     SUM(CASE WHEN t.kind='expense' THEN COALESCE(f.base_amount_minor, CASE WHEN t.currency=p.base_currency THEN t.amount_minor END) ELSE 0 END) expense_minor,
@@ -74,9 +108,10 @@ export function getSummary(actor: ActorContext, input: { start: string; end: str
   return {
     period: { start: filters.start, end: filters.end, semantics: "[start,end)", timezone: "由调用者将用户时区边界转换为 UTC" },
     currencies,
-    base: fx ? { currency: String(fx.base_currency), expense_minor: String(fx.expense_minor ?? 0), refund_minor: String(fx.refund_minor ?? 0), income_minor: String(fx.income_minor ?? 0), net_expense_minor: (BigInt(fx.expense_minor ?? 0) - BigInt(fx.refund_minor ?? 0)).toString(), net_cashflow_minor: (BigInt(fx.income_minor ?? 0) + BigInt(fx.refund_minor ?? 0) - BigInt(fx.expense_minor ?? 0)).toString(), missing_fx_count: Number(fx.missing_count), coverage: Number(fx.total_count) ? (Number(fx.total_count) - Number(fx.missing_count)) / Number(fx.total_count) : 1 } : null,
+    base: fx ? { currency: String(fx.base_currency), expense_minor: String(fx.expense_minor ?? 0), refund_minor: String(fx.refund_minor ?? 0), income_minor: String(fx.income_minor ?? 0), transfer_in_minor: "0", transfer_out_minor: "0", net_expense_minor: (BigInt(fx.expense_minor ?? 0) - BigInt(fx.refund_minor ?? 0)).toString(), net_cashflow_minor: (BigInt(fx.income_minor ?? 0) + BigInt(fx.refund_minor ?? 0) - BigInt(fx.expense_minor ?? 0)).toString(), transaction_count: Number(fx.total_count ?? 0), transfer_count: 0, missing_fx_count: Number(fx.missing_count), coverage: Number(fx.total_count) ? (Number(fx.total_count) - Number(fx.missing_count)) / Number(fx.total_count) : 1 } : null,
     groups: groups.map((g) => ({ label: String(g.label), currency: String(g.currency), net_expense_minor: String(g.net_expense_minor), count: Number(g.count) })),
     income_groups: incomeGroups.map((g) => ({ label: String(g.label), currency: String(g.currency), income_minor: String(g.income_minor), count: Number(g.count) })),
+    exchanges: summarizeExchanges(transactionRows),
     missing_fx_transaction_ids: [] as string[],
   };
 }
@@ -85,13 +120,14 @@ function getSecureSummary(actor: ActorContext, filters: z.infer<typeof summaryIn
   const rows = collectTransactions(actor, { start: filters.start, end: filters.end }) as Array<Record<string, unknown>>;
   const profile = readEncryptedEntity<Record<string, unknown>>(actor, "profile", actor.ownerId) ?? {};
   const baseCurrency = String(filters.display_currency ?? profile.base_currency ?? "HKD").toUpperCase();
-  const currencies = new Map<string, { expense: bigint; refund: bigint; income: bigint; count: number }>();
+  const currencies = new Map<string, { expense: bigint; refund: bigint; income: bigint; transferIn: bigint; transferOut: bigint; count: number; transferCount: number }>();
   const groups = new Map<string, { currency: string; net: bigint; count: number }>();
   const incomeGroups = new Map<string, { currency: string; income: bigint; count: number }>();
   let baseExpense = 0n; let baseRefund = 0n; let baseIncome = 0n; let missing = 0; let baseCount = 0; const missingIds: string[] = [];
   for (const row of rows) {
-    const kind = String(row.kind); if (kind === "transfer") continue;
-    const currency = String(row.currency); const amount = BigInt(String(row.amount_minor)); const current = currencies.get(currency) ?? { expense: 0n, refund: 0n, income: 0n, count: 0 }; current.count += 1; if (kind === "expense") current.expense += amount; if (kind === "refund") current.refund += amount; if (kind === "income") current.income += amount; currencies.set(currency, current);
+    const kind = String(row.kind); const currency = String(row.currency); const amount = BigInt(String(row.amount_minor)); const current = currencies.get(currency) ?? { expense: 0n, refund: 0n, income: 0n, transferIn: 0n, transferOut: 0n, count: 0, transferCount: 0 };
+    if (kind === "transfer") { current.transferCount += 1; if (row.transfer_direction === "in") current.transferIn += amount; if (row.transfer_direction === "out") current.transferOut += amount; currencies.set(currency, current); continue; }
+    current.count += 1; if (kind === "expense") current.expense += amount; if (kind === "refund") current.refund += amount; if (kind === "income") current.income += amount; currencies.set(currency, current);
     let label = filters.group_by === "payment_method" ? String(row.payment_method_name ?? row.payment_method ?? "未指定") : filters.group_by === "account" ? String(row.account_name ?? "未指定") : filters.group_by === "channel" ? String(row.channel_name ?? "未指定") : filters.group_by === "merchant" ? String(row.merchant ?? "未指定") : String(row.category_name ?? "未分类");
     if ((filters.group_by ?? "category") === "category" && filters.category_level !== "leaf" && row.category_id) {
       const category = readEncryptedEntity<Record<string, unknown>>(actor, "category", String(row.category_id));
@@ -115,10 +151,11 @@ function getSecureSummary(actor: ActorContext, filters: z.infer<typeof summaryIn
   }
   return {
     period: { start: filters.start, end: filters.end, semantics: "[start,end)", timezone: String(profile.timezone ?? "UTC") },
-    currencies: [...currencies.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([currency, value]) => ({ currency, expense_minor: value.expense.toString(), refund_minor: value.refund.toString(), income_minor: value.income.toString(), net_expense_minor: (value.expense - value.refund).toString(), net_cashflow_minor: (value.income + value.refund - value.expense).toString(), transaction_count: value.count })),
-    base: { currency: baseCurrency, expense_minor: baseExpense.toString(), refund_minor: baseRefund.toString(), income_minor: baseIncome.toString(), net_expense_minor: (baseExpense - baseRefund).toString(), net_cashflow_minor: (baseIncome + baseRefund - baseExpense).toString(), missing_fx_count: missing, coverage: baseCount ? (baseCount - missing) / baseCount : 1 },
+    currencies: [...currencies.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([currency, value]) => ({ currency, expense_minor: value.expense.toString(), refund_minor: value.refund.toString(), income_minor: value.income.toString(), transfer_in_minor: value.transferIn.toString(), transfer_out_minor: value.transferOut.toString(), net_expense_minor: (value.expense - value.refund).toString(), net_cashflow_minor: (value.income + value.refund + value.transferIn - value.expense - value.transferOut).toString(), transaction_count: value.count, transfer_count: value.transferCount })),
+    base: { currency: baseCurrency, expense_minor: baseExpense.toString(), refund_minor: baseRefund.toString(), income_minor: baseIncome.toString(), transfer_in_minor: "0", transfer_out_minor: "0", net_expense_minor: (baseExpense - baseRefund).toString(), net_cashflow_minor: (baseIncome + baseRefund - baseExpense).toString(), transaction_count: baseCount, transfer_count: 0, missing_fx_count: missing, coverage: baseCount ? (baseCount - missing) / baseCount : 1 },
     groups: [...groups.entries()].sort(([, a], [, b]) => b.net === a.net ? 0 : b.net > a.net ? 1 : -1).slice(0, 30).map(([key, value]) => ({ label: key.split("\u0000")[0], currency: value.currency, net_expense_minor: value.net.toString(), count: value.count })),
     income_groups: [...incomeGroups.entries()].sort(([, a], [, b]) => b.income === a.income ? 0 : b.income > a.income ? 1 : -1).slice(0, 30).map(([key, value]) => ({ label: key.split("\u0000")[0], currency: value.currency, income_minor: value.income.toString(), count: value.count })),
+    exchanges: summarizeExchanges(rows),
     missing_fx_transaction_ids: missingIds,
   };
 }
