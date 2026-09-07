@@ -34,6 +34,8 @@ const transactionSchema = z.object({
   transfer_group_id: optionalUuid,
   transfer_direction: z.enum(["in", "out"]).nullish(),
   counterparty_account_id: optionalUuid,
+  counterparty_amount_minor: amountMinor.optional(),
+  counterparty_currency: z.string().length(3).transform((value) => value.toUpperCase()).optional(),
   source: z.enum(["manual", "ai_confirmed", "mcp"]).default("manual"),
   idempotency_key: z.string().min(8).max(160),
   fx: z.object({ base_currency: z.string().length(3).transform((value) => value.toUpperCase()), rate: positiveRate, rate_date: z.iso.date(), rate_source: z.string().trim().min(1).max(80).default("manual") }).optional(),
@@ -43,6 +45,10 @@ export const createTransactionSchema = transactionSchema.superRefine((data, ctx)
   if (data.kind === "refund" && !data.related_transaction_id) ctx.addIssue({ code: "custom", path: ["related_transaction_id"], message: "退款必须关联原消费" });
   if (data.kind !== "transfer" && data.transfer_direction) ctx.addIssue({ code: "custom", path: ["transfer_direction"], message: "只有转账可以设置方向" });
   if (data.kind === "transfer" && data.counterparty_account_id && !data.account_id) ctx.addIssue({ code: "custom", path: ["account_id"], message: "成组转账必须选择转出账户" });
+  if (data.kind !== "transfer" && (data.counterparty_amount_minor || data.counterparty_currency)) ctx.addIssue({ code: "custom", path: ["counterparty_amount_minor"], message: "只有转账可以设置到账金额和币种" });
+  if (data.kind === "transfer" && Boolean(data.counterparty_amount_minor) !== Boolean(data.counterparty_currency)) ctx.addIssue({ code: "custom", path: ["counterparty_amount_minor"], message: "到账金额和到账币种必须同时填写" });
+  if (data.kind === "transfer" && (data.counterparty_amount_minor || data.counterparty_currency) && !data.counterparty_account_id) ctx.addIssue({ code: "custom", path: ["counterparty_account_id"], message: "填写到账金额时必须选择转入账户" });
+  if (data.kind === "transfer" && data.counterparty_currency === data.currency && data.counterparty_amount_minor && data.counterparty_amount_minor !== data.amount_minor) ctx.addIssue({ code: "custom", path: ["counterparty_amount_minor"], message: "同币种转账的转出与到账金额必须一致" });
   if (data.kind === "transfer" && data.fx) ctx.addIssue({ code: "custom", path: ["fx"], message: "首版成组转账不接受折算快照" });
   if (data.account_id && data.counterparty_account_id === data.account_id) ctx.addIssue({ code: "custom", path: ["counterparty_account_id"], message: "转入与转出账户不能相同" });
 });

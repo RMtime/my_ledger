@@ -24,6 +24,10 @@ const maximumMinorAmount = 999_999_999_999_999n;
 const fields = `t.id,t.kind,t.amount_minor,t.currency,t.occurred_at,t.occurred_timezone,t.time_precision,
   t.category_id,c.name category_name,t.payment_method,t.payment_method_id,pm.name payment_method_name,t.account_id,a.name account_name,t.channel_id,ch.name channel_name,
   t.merchant,t.note,t.related_transaction_id,t.transfer_group_id,t.transfer_direction,t.source,t.agent_id,
+  (SELECT peer.amount_minor FROM transactions peer WHERE peer.owner_id=t.owner_id AND peer.transfer_group_id=t.transfer_group_id AND peer.id<>t.id LIMIT 1) counterparty_amount_minor,
+  (SELECT peer.currency FROM transactions peer WHERE peer.owner_id=t.owner_id AND peer.transfer_group_id=t.transfer_group_id AND peer.id<>t.id LIMIT 1) counterparty_currency,
+  (SELECT peer.account_id FROM transactions peer WHERE peer.owner_id=t.owner_id AND peer.transfer_group_id=t.transfer_group_id AND peer.id<>t.id LIMIT 1) counterparty_account_id,
+  (SELECT peer_account.name FROM transactions peer JOIN accounts peer_account ON peer_account.owner_id=peer.owner_id AND peer_account.id=peer.account_id WHERE peer.owner_id=t.owner_id AND peer.transfer_group_id=t.transfer_group_id AND peer.id<>t.id LIMIT 1) counterparty_account_name,
   t.idempotency_key,t.version,t.created_at,t.updated_at,t.deleted_at,
   CASE WHEN t.kind='expense' THEN t.amount_minor-COALESCE((SELECT SUM(r.amount_minor) FROM transactions r
     WHERE r.owner_id=t.owner_id AND r.related_transaction_id=t.id AND r.kind='refund' AND r.deleted_at IS NULL),0)
@@ -89,12 +93,15 @@ function getOwned(ownerId: string, id: string, actor?: ActorContext) {
   // string API values back to bigint locally instead of leaking bigint across
   // encryption, audit, MCP, or Response.json boundaries.
   materialized.amount_minor = String(value.amount_minor);
+  if (value.counterparty_amount_minor !== undefined && value.counterparty_amount_minor !== null) materialized.counterparty_amount_minor = String(value.counterparty_amount_minor);
   const category = value.category_id ? readEncryptedEntity<Row>(actor, "category", String(value.category_id)) : undefined;
   const account = value.account_id ? readEncryptedEntity<Row>(actor, "account", String(value.account_id)) : undefined;
+  const counterpartyAccount = value.counterparty_account_id ? readEncryptedEntity<Row>(actor, "account", String(value.counterparty_account_id)) : undefined;
   const channel = value.channel_id ? readEncryptedEntity<Row>(actor, "channel", String(value.channel_id)) : undefined;
   const payment = value.payment_method_id ? readEncryptedEntity<Row>(actor, "payment_method", String(value.payment_method_id)) : undefined;
   materialized.category_name = category?.name ?? null;
   materialized.account_name = account?.name ?? null;
+  materialized.counterparty_account_name = counterpartyAccount?.name ?? null;
   materialized.channel_name = channel?.name ?? null;
   materialized.payment_method_name = payment?.name ?? null;
   materialized.payment_method = value.payment_method ?? payment?.legacy_code ?? null;
@@ -184,14 +191,25 @@ function secureIdempotentTransaction(actor: ActorContext, idempotencyKey: string
   return { transaction: serialize(getOwned(actor.ownerId, row.entity_id, actor)), deduplicated: true };
 }
 
+function normalizeCreateFields(input: CreateTransactionInput): CreateTransactionInput {
+  const withoutTransferFields = { ...input, counterparty_account_id: null, counterparty_amount_minor: undefined, counterparty_currency: undefined, transfer_group_id: null, transfer_direction: null };
+  if (input.kind === "expense") return { ...withoutTransferFields, related_transaction_id: null };
+  if (input.kind === "income") return { ...withoutTransferFields, payment_method: null, payment_method_id: null, channel_id: null, related_transaction_id: null };
+  if (input.kind === "refund") return { ...withoutTransferFields, payment_method: null, payment_method_id: null, channel_id: null };
+  return { ...input, category_id: null, payment_method: null, payment_method_id: null, channel_id: null, merchant: null, related_transaction_id: null, fx: undefined };
+}
+
 function createSecureTransferPair(actor: ActorContext, input: CreateTransactionInput, requestHash: string) {
   assertOwnedReference(actor.ownerId, "accounts", input.account_id);
   assertOwnedReference(actor.ownerId, "accounts", input.counterparty_account_id);
   const sourceAccount = input.account_id ? readEncryptedEntity<Row>(actor, "account", input.account_id) : undefined;
   const targetAccount = input.counterparty_account_id ? readEncryptedEntity<Row>(actor, "account", input.counterparty_account_id) : undefined;
-  if (!sourceAccount || !targetAccount || sourceAccount.currency !== input.currency || targetAccount.currency !== input.currency) {
-    throw new AppError("CONFLICT", "成组转账要求两个账户与账目币种相同", 409);
+  const targetAmount = input.counterparty_amount_minor ?? input.amount_minor;
+  const targetCurrency = input.counterparty_currency ?? input.currency;
+  if (!sourceAccount || !targetAccount || sourceAccount.currency !== input.currency || targetAccount.currency !== targetCurrency) {
+    throw new AppError("CONFLICT", "转出和转入账户必须分别匹配对应币种", 409);
   }
+  if (input.currency === targetCurrency && input.amount_minor !== targetAmount) throw new AppError("CONFLICT", "同币种转账的转出与到账金额必须一致", 409);
   const duplicate = secureIdempotentTransaction(actor, input.idempotency_key, requestHash);
   if (duplicate) return duplicate;
   const groupId = randomUUID(); const outId = randomUUID(); const inId = randomUUID(); const timestamp = now();
@@ -200,12 +218,12 @@ function createSecureTransferPair(actor: ActorContext, input: CreateTransactionI
     VALUES (?,?,'expense',1,'XXX','1970-01-01T00:00:00.000Z','UTC','date',?,?,?,?,?,?,?,?,?,?)`);
   sqlite.exec("BEGIN IMMEDIATE");
   try {
-    const common = { ...input, owner_id: actor.ownerId, kind: "transfer", amount_minor: input.amount_minor, transfer_group_id: groupId, source: input.source, agent_id: actor.actorType === "agent" ? actor.actorId : null, request_hash: requestHash, version: 1, created_at: timestamp, updated_at: timestamp, deleted_at: null };
+    const common = { ...input, owner_id: actor.ownerId, kind: "transfer", transfer_group_id: groupId, source: input.source, agent_id: actor.actorType === "agent" ? actor.actorId : null, request_hash: requestHash, version: 1, created_at: timestamp, updated_at: timestamp, deleted_at: null };
     insert.run(outId, actor.ownerId, input.account_id, groupId, "out", input.source, common.agent_id, `enc:${outId}`, blindIndex(actor.vaultKey!, actor.ownerId, "transaction:request", requestHash), 1, timestamp, timestamp);
     insert.run(inId, actor.ownerId, input.counterparty_account_id, groupId, "in", input.source, common.agent_id, `enc:${inId}`, blindIndex(actor.vaultKey!, actor.ownerId, "transaction:request", `${requestHash}:in`), 1, timestamp, timestamp);
-    const indexes = (idempotency: string) => ({ month: DateTime.fromISO(input.occurred_at).setZone(input.occurred_timezone).toFormat("yyyy-MM"), kind: "transfer", currency: input.currency, idempotency });
-    upsertEncryptedEntity(actor, "transaction", outId, { ...common, id: outId, account_id: input.account_id, counterparty_account_id: input.counterparty_account_id, transfer_direction: "out", idempotency_key: input.idempotency_key }, indexes(input.idempotency_key));
-    upsertEncryptedEntity(actor, "transaction", inId, { ...common, id: inId, account_id: input.counterparty_account_id, counterparty_account_id: input.account_id, transfer_direction: "in", idempotency_key: `${input.idempotency_key}:in` }, indexes(`${input.idempotency_key}:in`));
+    const indexes = (currency: string, idempotency: string) => ({ month: DateTime.fromISO(input.occurred_at).setZone(input.occurred_timezone).toFormat("yyyy-MM"), kind: "transfer", currency, idempotency });
+    upsertEncryptedEntity(actor, "transaction", outId, { ...common, id: outId, amount_minor: input.amount_minor, currency: input.currency, account_id: input.account_id, counterparty_account_id: input.counterparty_account_id, counterparty_amount_minor: targetAmount, counterparty_currency: targetCurrency, transfer_direction: "out", idempotency_key: input.idempotency_key }, indexes(input.currency, input.idempotency_key));
+    upsertEncryptedEntity(actor, "transaction", inId, { ...common, id: inId, amount_minor: targetAmount, currency: targetCurrency, account_id: input.counterparty_account_id, counterparty_account_id: input.account_id, counterparty_amount_minor: input.amount_minor, counterparty_currency: input.currency, transfer_direction: "in", idempotency_key: `${input.idempotency_key}:in` }, indexes(targetCurrency, `${input.idempotency_key}:in`));
     writeSecureAudit(actor, "transfer.create", outId, null, { transaction_ids: [outId, inId], transfer_group_id: groupId });
     sqlite.exec("COMMIT");
     const pair = [serialize(getOwned(actor.ownerId, outId, actor))!, serialize(getOwned(actor.ownerId, inId, actor))!];
@@ -256,7 +274,7 @@ export function createTransaction(actor: ActorContext, raw: unknown) {
   requirePermission(actor, "transactions:create");
   const parsed = createTransactionSchema.safeParse(raw);
   if (!parsed.success) throw new AppError("VALIDATION_ERROR", "账目字段不完整或格式不正确", 422, parsed.error.flatten());
-  const input = parsed.data;
+  const input = normalizeCreateFields(parsed.data);
   const requestHash = hash(input);
   if (secureMode(actor)) return createSecureTransaction(actor, input, requestHash);
   const existing = sqlite.prepare("SELECT id, request_hash FROM transactions WHERE owner_id=? AND idempotency_key=?").get(actor.ownerId, input.idempotency_key) as { id: string; request_hash: string } | undefined;
@@ -312,13 +330,18 @@ function createTransferPair(actor: ActorContext, input: CreateTransactionInput, 
   try {
     assertOwnedReference(actor.ownerId, "accounts", input.account_id); assertOwnedReference(actor.ownerId, "accounts", input.counterparty_account_id);
     const accounts = sqlite.prepare("SELECT id,currency FROM accounts WHERE owner_id=? AND id IN (?,?)").all(actor.ownerId,input.account_id,input.counterparty_account_id) as Array<{id:string;currency:string}>;
-    if (accounts.length !== 2 || accounts.some(account=>account.currency!==input.currency)) throw new AppError("CONFLICT","首版成组转账要求两个账户与账目币种相同",409);
+    const sourceAccount = accounts.find((account) => account.id === input.account_id);
+    const targetAccount = accounts.find((account) => account.id === input.counterparty_account_id);
+    const targetAmount = input.counterparty_amount_minor ?? input.amount_minor;
+    const targetCurrency = input.counterparty_currency ?? input.currency;
+    if (!sourceAccount || !targetAccount || sourceAccount.currency !== input.currency || targetAccount.currency !== targetCurrency) throw new AppError("CONFLICT","转出和转入账户必须分别匹配对应币种",409);
+    if (input.currency === targetCurrency && input.amount_minor !== targetAmount) throw new AppError("CONFLICT","同币种转账的转出与到账金额必须一致",409);
     const groupId=randomUUID(),outId=randomUUID(),inId=randomUUID(),timestamp=now();
     const insert=sqlite.prepare(`INSERT INTO transactions
       (id,owner_id,kind,amount_minor,currency,occurred_at,occurred_timezone,time_precision,account_id,note,transfer_group_id,transfer_direction,source,agent_id,idempotency_key,request_hash,version,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     insert.run(outId,actor.ownerId,"transfer",BigInt(input.amount_minor),input.currency,input.occurred_at,input.occurred_timezone,input.time_precision,input.account_id,input.note??null,groupId,"out",input.source,actor.actorType==="agent"?actor.actorId:null,input.idempotency_key,requestHash,1,timestamp,timestamp);
-    insert.run(inId,actor.ownerId,"transfer",BigInt(input.amount_minor),input.currency,input.occurred_at,input.occurred_timezone,input.time_precision,input.counterparty_account_id,input.note??null,groupId,"in",input.source,actor.actorType==="agent"?actor.actorId:null,`${input.idempotency_key}:in`,requestHash,1,timestamp,timestamp);
+    insert.run(inId,actor.ownerId,"transfer",BigInt(targetAmount),targetCurrency,input.occurred_at,input.occurred_timezone,input.time_precision,input.counterparty_account_id,input.note??null,groupId,"in",input.source,actor.actorType==="agent"?actor.actorId:null,`${input.idempotency_key}:in`,requestHash,1,timestamp,timestamp);
     const pair=[serialize(getOwned(actor.ownerId,outId))!,serialize(getOwned(actor.ownerId,inId))!];
     sqlite.prepare(`INSERT INTO audit_events (id,owner_id,actor_type,actor_id,operation,transaction_id,after_json,request_id,created_at) VALUES (?,?,?,?,?,?,?,?,?)`).run(randomUUID(),actor.ownerId,actor.actorType,actor.actorId,"transfer.create",outId,JSON.stringify(pair),actor.requestId,timestamp);
     sqlite.exec("COMMIT"); response={transaction:pair[0],pair,deduplicated:false};

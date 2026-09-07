@@ -51,9 +51,11 @@ describe("encrypted user vault", () => {
     const expense = createTransaction(actor, { kind: "expense", amount_minor: "1000", currency: "HKD", occurred_at: "2026-09-07T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", idempotency_key: randomUUID(), source: "manual" }).transaction as { id: string };
     createTransaction(actor, { kind: "refund", amount_minor: "400", currency: "HKD", occurred_at: "2026-09-08T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", related_transaction_id: expense.id, idempotency_key: randomUUID(), source: "manual" });
     expect(() => createTransaction(actor, { kind: "refund", amount_minor: "700", currency: "HKD", occurred_at: "2026-09-09T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", related_transaction_id: expense.id, idempotency_key: randomUUID(), source: "manual" })).toThrow("不能超过");
-    const accounts = listMetadata(actor).accounts;
-    const result = createTransaction(actor, { kind: "transfer", amount_minor: "250", currency: "HKD", occurred_at: "2026-09-10T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", account_id: String(accounts[0].id), counterparty_account_id: String(accounts[1].id), idempotency_key: randomUUID(), source: "manual" }) as unknown as { pair: Array<{ kind: string; transfer_direction: string }> };
-    expect(result.pair).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "transfer", transfer_direction: "out" }), expect.objectContaining({ kind: "transfer", transfer_direction: "in" })]));
+    const sourceAccount = listMetadata(actor).accounts.find((account) => account.currency === "HKD");
+    if (!sourceAccount) throw new Error("missing HKD starter account");
+    const targetAccount = createMetadata(actor, "account", { name: "测试人民币钱包", type: "wallet", currency: "CNY" });
+    const result = createTransaction(actor, { kind: "transfer", amount_minor: "100000", currency: "HKD", counterparty_amount_minor: "92000", counterparty_currency: "CNY", occurred_at: "2026-09-10T12:00:00+08:00", occurred_timezone: "Asia/Hong_Kong", time_precision: "minute", account_id: String(sourceAccount.id), counterparty_account_id: targetAccount.id, idempotency_key: randomUUID(), source: "manual" }) as unknown as { pair: Array<Record<string, string>> };
+    expect(result.pair).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "transfer", transfer_direction: "out", amount_minor: "100000", currency: "HKD", counterparty_amount_minor: "92000", counterparty_currency: "CNY" }), expect.objectContaining({ kind: "transfer", transfer_direction: "in", amount_minor: "92000", currency: "CNY", counterparty_amount_minor: "100000", counterparty_currency: "HKD" })]));
   });
   it("uses the encrypted profile currency for manual FX without exposing the snapshot amount", () => {
     updateProfile(actor, { base_currency: "CNY" });
